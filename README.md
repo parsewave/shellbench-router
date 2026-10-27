@@ -96,20 +96,6 @@ export HARBOR_ALLOW_INTERNET=1           # let the agent reach the gateway direc
 harbor trial start -p path/to/task -a codex -m openai/gpt-6.1-terra
 ```
 
-**On Parsewave servers** (the Harbor build with the Parsewave proxy), Codex uses your Parsewave login instead of the gateway token if it finds one. Run Harbor with an empty home directory and no Parsewave token so it uses the gateway:
-
-```bash
-env -u PARSEWAVE_TOKEN -u CODEX_PARSEWAVE_TOKEN -u CODEX_HTTPS_PROXY -u CODEX_AUTH_B64 \
-  HOME=$(mktemp -d) PATH=$HOME/.local/bin:$PATH \
-  harbor trial start -p path/to/task -a codex -m openai/gpt-6.1-terra
-```
-
-To check it's working: `docker compose logs -f proxy` on the gateway shows each request as `"client":"harbor"` with `"status":200`.
-
-**Which agent to use:** some providers serve a model only over the Responses API. PackyAPI does this for `gpt-6.1-terra`, and answers chat completions with `protocol_not_supported`. For those models, use an agent that speaks the Responses API, such as `codex`. Agents that use chat completions (LiteLLM-based ones such as `terminus-2`) need a model the provider serves over chat completions.
-
----
-
 ## Everyday commands
 
 ```bash
