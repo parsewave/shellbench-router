@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# One-time provider setup: writes .env and secrets/upstream_api_key, starts
-# Caddy + the proxy, and optionally creates the first client token.
+# One-time provider setup: writes .env, secrets/upstream_api_key and the
+# admin API key, starts Caddy + the proxy, and optionally creates the first
+# client token.
 #
 #   scripts/setup.sh                                  # interactive
-#   scripts/setup.sh --provider openrouter --domain auto --client alice
+#   scripts/setup.sh --provider openrouter --domain auto --client alice --client-pubkey ed25519:...
 #   UPSTREAM_KEY=sk-... scripts/setup.sh --provider openai --domain llm.example.com --yes
 #
 # Run it from anywhere; it operates on the repository it lives in.
@@ -24,9 +25,12 @@ Deployment:
   --domain NAME            public hostname for HTTPS; "auto" = <public-ip>.sslip.io
   --host-network           use host networking (deploy/docker-compose.host.yml)
   --force                  overwrite an existing .env / key file
+  --no-admin               don't enable the admin HTTP API (manage tokens only via scripts/keys.sh)
 
 First client (optional):
   --client ID              create a client token with this id (printed once)
+  --client-pubkey KEY      the user's public key from `pxkey generate` (signed token; the default)
+  --client-unsigned        create a plain bearer token instead (for tools that can't sign)
   --client-models LIST     restrict it to these models (comma-separated, prefix* ok)
   --client-concurrency N   max concurrent requests for it (default 64)
 
@@ -37,7 +41,7 @@ EOF
 }
 
 PROVIDER="" BASE_URL="" REFERER="" TITLE="" DOMAIN="" HOST_NET=0 FORCE=0 YES=0
-CLIENT="" CLIENT_MODELS="" CLIENT_CONC=64
+CLIENT="" CLIENT_MODELS="" CLIENT_CONC=64 CLIENT_PUBKEY="" CLIENT_UNSIGNED=0 ADMIN=1
 while [ $# -gt 0 ]; do
 	case $1 in
 	--provider) PROVIDER=$2; shift 2 ;;
@@ -50,6 +54,9 @@ while [ $# -gt 0 ]; do
 	--client) CLIENT=$2; shift 2 ;;
 	--client-models) CLIENT_MODELS=$2; shift 2 ;;
 	--client-concurrency) CLIENT_CONC=$2; shift 2 ;;
+	--client-pubkey) CLIENT_PUBKEY=$2; shift 2 ;;
+	--client-unsigned) CLIENT_UNSIGNED=1; shift ;;
+	--no-admin) ADMIN=0; shift ;;
 	--yes) YES=1; shift ;;
 	-h | --help) usage; exit 0 ;;
 	*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -68,6 +75,9 @@ ask() { # ask VAR "prompt" [default]
 command -v docker >/dev/null || die "docker is not installed"
 docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
 [ -f docker-compose.yml ] || die "run from the repository (docker-compose.yml not found)"
+if [ -n "$CLIENT" ] && [ -z "$CLIENT_PUBKEY" ] && [ "$CLIENT_UNSIGNED" != 1 ]; then
+	die "--client needs --client-pubkey (the user's key from \`pxkey generate\`) or --client-unsigned"
+fi
 if [ -e .env ] && [ "$FORCE" != 1 ]; then
 	die ".env already exists. Re-run with --force to replace it, or manage keys with scripts/keys.sh"
 fi
@@ -134,9 +144,28 @@ else
 	say "No sudo: key file is 0444 inside the 0700 secrets/ directory"
 fi
 
+# --- admin API key ---------------------------------------------------------
+# Lets the operator manage tokens over HTTPS (pxadmin / curl) instead of SSH.
+ADMIN_KEY=""
+if [ "$ADMIN" = 1 ]; then
+	if [ -e secrets/admin_api_key ]; then
+		say "Keeping the existing admin key (rotate it with scripts/keys.sh admin-key)"
+	else
+		ADMIN_KEY="sk-pxadmin-$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')"
+		(umask 077 && printf '%s' "$ADMIN_KEY" >secrets/admin_api_key)
+		if [ "$(uname -s)" = Linux ] && { [ -n "$SUDO" ] || [ "$(id -u)" = 0 ]; }; then
+			$SUDO chown 65532:65532 secrets/admin_api_key
+			$SUDO chmod 0400 secrets/admin_api_key
+		else
+			chmod 0444 secrets/admin_api_key
+		fi
+	fi
+fi
+
 # --- .env ------------------------------------------------------------------
 COMPOSE_FILES="docker-compose.yml:deploy/docker-compose.keyfile.yml"
 [ "$HOST_NET" = 1 ] && COMPOSE_FILES="$COMPOSE_FILES:deploy/docker-compose.host.yml"
+[ "$ADMIN" = 1 ] && COMPOSE_FILES="$COMPOSE_FILES:deploy/docker-compose.admin.yml"
 (
 	umask 077
 	cat >.env <<EOF
@@ -166,6 +195,7 @@ say "Proxy healthy (upstream key fingerprint ${fp:-?})"
 if [ -n "$CLIENT" ]; then
 	args=(add -id "$CLIENT" -concurrency "$CLIENT_CONC")
 	[ -n "$CLIENT_MODELS" ] && args+=(-models "$CLIENT_MODELS")
+	if [ -n "$CLIENT_PUBKEY" ]; then args+=(-pubkey "$CLIENT_PUBKEY"); else args+=(-unsigned); fi
 	TOKEN=$(docker compose run --rm --no-deps -T proxy token "${args[@]}" 2>/dev/null) || die "could not create client $CLIENT"
 	say "Client '$CLIENT' created. Its token (shown once; store it securely):"
 	printf '%s\n' "$TOKEN"
@@ -180,7 +210,7 @@ for _ in $(seq 30); do
 done
 if [ "$ok" = 1 ]; then
 	say "https://$DOMAIN/healthz is up"
-	if [ -n "${TOKEN:-}" ]; then
+	if [ -n "${TOKEN:-}" ] && [ -z "$CLIENT_PUBKEY" ]; then # signed tokens can only be checked from the user's machine
 		n=$(curl -fsS -m 30 -H "Authorization: Bearer $TOKEN" "https://$DOMAIN/v1/models" | grep -o '"id"' | wc -l | tr -d ' ') &&
 			say "Upstream reachable: $n models visible to '$CLIENT'" ||
 			say "Upstream check failed: GET /v1/models did not succeed (check the key and base URL)"
@@ -191,9 +221,24 @@ fi
 
 cat >&2 <<EOF
 
-Done. Clients use:
-  base_url = https://$DOMAIN/v1
-  api_key  = <their proxy token>
+Done. Gateway: https://$DOMAIN/v1
+EOF
+if [ -n "$ADMIN_KEY" ]; then
+	cat >&2 <<EOF
 
-Manage keys with scripts/keys.sh (add, list, rotate, revoke, upstream-key, ...).
+Admin key (shown once; put it in your password manager):
+
+  $ADMIN_KEY
+
+Manage tokens from your own machine:
+  pip install "pxclient @ git+https://github.com/parsewave/shellbench-router.git#subdirectory=clients/python"
+  export PX_ADMIN_URL=https://$DOMAIN PX_ADMIN_KEY=<the key above>
+  pxadmin add alice --pubkey ed25519:...      # the user's key from \`pxkey generate\`
+EOF
+	ADMIN_KEY=""
+fi
+cat >&2 <<EOF
+
+On this server, scripts/keys.sh does the same (add, list, rotate, revoke, ...).
+See README "Getting started".
 EOF

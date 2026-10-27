@@ -26,9 +26,12 @@ from .signer import (
     public_key_string,
     string_to_sign,
 )
+from .admin import Admin, AdminError
 from .openai_client import signed_async_openai, signed_openai
 
 __all__ = [
+    "Admin",
+    "AdminError",
     "HEADER_NONCE",
     "HEADER_SIGNATURE",
     "HEADER_TIMESTAMP",
