@@ -17,13 +17,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
-
-	"oaiproxy/internal/signing"
 )
 
 // Prefix marks proxy tokens so they are easy to recognise in secret scanners.
@@ -48,10 +47,9 @@ type Client struct {
 	Burst         int        `json:"burst,omitempty"`          // token-bucket size, 0 = RPM
 	MaxConcurrent int        `json:"max_concurrent,omitempty"` // in-flight requests, 0 = unlimited
 	Secrets       []Secret   `json:"secrets"`
-	// PublicKeys are Ed25519 request-signing keys. A client with at least
-	// one key must sign every request (see internal/signing) in addition to
-	// presenting its bearer token, so a leaked token alone is useless.
-	PublicKeys []PublicKey `json:"public_keys,omitempty"`
+	// AllowedIPs restricts where the token works: IP addresses or CIDR
+	// ranges. Empty = any IP. A leaked token is useless from anywhere else.
+	AllowedIPs []string `json:"allowed_ips,omitempty"`
 }
 
 // Secret is one valid credential for a client. Several may be valid at once
@@ -136,7 +134,6 @@ func (f *File) Validate() error {
 	}
 	ids := map[string]bool{}
 	hashes := map[string]bool{}
-	keys := map[string]bool{}
 	for _, c := range f.Clients {
 		if !idRE.MatchString(c.ID) {
 			return fmt.Errorf("invalid client id %q (allowed: letters, digits, _ . -, max 64)", c.ID)
@@ -164,21 +161,13 @@ func (f *File) Validate() error {
 			}
 			hashes[h] = true
 		}
-		if len(c.PublicKeys) > MaxPublicKeys {
-			return fmt.Errorf("client %q: at most %d public keys", c.ID, MaxPublicKeys)
+		if len(c.AllowedIPs) > MaxAllowedIPs {
+			return fmt.Errorf("client %q: at most %d allowed IP entries", c.ID, MaxAllowedIPs)
 		}
-		for _, k := range c.PublicKeys {
-			pub, err := ParsePublicKey(k.Key)
-			if err != nil {
-				return fmt.Errorf("client %q: public key %q: %w", c.ID, k.ID, err)
+		for _, ip := range c.AllowedIPs {
+			if _, err := ParseIPPrefix(ip); err != nil {
+				return fmt.Errorf("client %q: %w", c.ID, err)
 			}
-			if k.ID != KeyID(pub) {
-				return fmt.Errorf("client %q: public key id %q does not match its key (want %q)", c.ID, k.ID, KeyID(pub))
-			}
-			if keys[k.ID] {
-				return fmt.Errorf("client %q: duplicate public key %q", c.ID, k.ID)
-			}
-			keys[k.ID] = true
 		}
 	}
 	return nil
@@ -261,6 +250,50 @@ func (c *Client) Status(now time.Time) string {
 	return "no-valid-secret"
 }
 
+// MaxAllowedIPs bounds a client's IP allowlist.
+const MaxAllowedIPs = 64
+
+// ParseIPPrefix accepts an address ("203.0.113.7", "2001:db8::1") or a
+// CIDR range ("10.0.0.0/8"); an address means exactly that host.
+func ParseIPPrefix(s string) (netip.Prefix, error) {
+	s = strings.TrimSpace(s)
+	if strings.Contains(s, "/") {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return netip.Prefix{}, fmt.Errorf("invalid IP range %q", s)
+		}
+		if p.Addr().Is4In6() {
+			p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+		}
+		return p.Masked(), nil
+	}
+	a, err := netip.ParseAddr(s)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("invalid IP address %q", s)
+	}
+	a = a.Unmap()
+	return netip.PrefixFrom(a, a.BitLen()), nil
+}
+
+// ParseIPList splits a comma-separated allowlist; "", "*" or "any" = any IP.
+func ParseIPList(s string) ([]string, error) {
+	var out []string
+	for _, v := range strings.Split(s, ",") {
+		v = strings.TrimSpace(v)
+		switch v {
+		case "":
+			continue
+		case "*", "any":
+			return nil, nil
+		}
+		if _, err := ParseIPPrefix(v); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
 // Lookup errors returned (wrapped) by File methods.
 var (
 	ErrNotFound = errors.New("not found")
@@ -283,13 +316,22 @@ type Principal struct {
 	RPM           int
 	Burst         int
 	MaxConcurrent int
-	// Keys are the client's request-signing keys; non-empty means every
-	// request must carry a valid signature from one of them.
-	Keys []signing.Key
+	AllowedIPs    []netip.Prefix // empty = any IP
 }
 
-// SignatureRequired reports whether requests must be signed.
-func (p *Principal) SignatureRequired() bool { return len(p.Keys) > 0 }
+// AllowsIP reports whether requests from ip may use this token.
+func (p *Principal) AllowsIP(ip netip.Addr) bool {
+	if len(p.AllowedIPs) == 0 {
+		return true
+	}
+	ip = ip.Unmap()
+	for _, pfx := range p.AllowedIPs {
+		if pfx.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
 
 // Restricted reports whether the client has a model allow-list.
 func (p *Principal) Restricted() bool {
@@ -338,9 +380,9 @@ func NewStore(f *File) *Store {
 	s := &Store{}
 	for _, c := range f.Clients {
 		p := &Principal{ID: c.ID, Models: append([]string(nil), c.Models...), RPM: c.RPM, Burst: c.Burst, MaxConcurrent: c.MaxConcurrent}
-		for _, k := range c.PublicKeys {
-			pub, _ := ParsePublicKey(k.Key) // validated by File.Validate
-			p.Keys = append(p.Keys, signing.Key{ID: k.ID, Pub: pub, ExpiresAt: k.ExpiresAt})
+		for _, ip := range c.AllowedIPs {
+			pfx, _ := ParseIPPrefix(ip) // validated by File.Validate
+			p.AllowedIPs = append(p.AllowedIPs, pfx)
 		}
 		s.ids = append(s.ids, c.ID)
 		for _, sec := range c.Secrets {

@@ -2,15 +2,12 @@
 
     export PX_ADMIN_URL=https://llm.example.com PX_ADMIN_KEY=sk-pxadmin-...
 
-    pxadmin add alice --pubkey ed25519:... --models gpt-4o-mini --concurrency 16 --expires 90d
-    pxadmin add ci-bot --unsigned --concurrency 4        # plain token, for tools that can't sign
+    pxadmin add alice --allow-ips 203.0.113.7 --models gpt-4o-mini --expires 90d
     pxadmin list
     pxadmin show alice
-    pxadmin set alice --rpm 600 --models '*'
+    pxadmin set alice --allow-ips 203.0.113.7,10.0.0.0/8 --rpm 600 --models '*'
     pxadmin rotate alice --grace 24h
     pxadmin revoke alice | enable alice | remove alice
-    pxadmin add-key alice --pubkey ed25519:...           # e.g. a second machine
-    pxadmin remove-key alice k_0123456789ab [--allow-unsigned]
 """
 
 from __future__ import annotations
@@ -54,13 +51,8 @@ class Admin:
     def show(self, id: str) -> dict:
         return self._call("GET", f"/clients/{id}")
 
-    def add(self, id: str, public_key: Optional[str] = None, unsigned: bool = False, **fields: Any) -> dict:
-        body = {"id": id, **{k: v for k, v in fields.items() if v is not None}}
-        if public_key:
-            body["public_key"] = public_key
-        if unsigned:
-            body["unsigned"] = True
-        return self._call("POST", "/clients", body)
+    def add(self, id: str, **fields: Any) -> dict:
+        return self._call("POST", "/clients", {"id": id, **{k: v for k, v in fields.items() if v is not None}})
 
     def set(self, id: str, **fields: Any) -> dict:
         return self._call("PATCH", f"/clients/{id}", {k: v for k, v in fields.items() if v is not None})
@@ -77,13 +69,6 @@ class Admin:
     def remove(self, id: str) -> None:
         self._call("DELETE", f"/clients/{id}")
 
-    def add_key(self, id: str, public_key: str, note: str = "", expires: str = "") -> dict:
-        return self._call("POST", f"/clients/{id}/keys", {"public_key": public_key, "note": note, "expires": expires})
-
-    def remove_key(self, id: str, key_id: str, allow_unsigned: bool = False) -> None:
-        self._call("DELETE", f"/clients/{id}/keys/{key_id}", params={"allow_unsigned": "true"} if allow_unsigned else None)
-
-
 def _models(s: Optional[str]):
     if s is None:
         return None
@@ -93,6 +78,7 @@ def _models(s: Optional[str]):
 def _limits(args) -> dict:
     return {
         "models": _models(args.models),
+        "allowed_ips": _models(args.allow_ips),
         "rpm": args.rpm,
         "burst": args.burst,
         "max_concurrent": args.concurrency,
@@ -102,9 +88,8 @@ def _limits(args) -> dict:
 
 
 def _status(c: dict) -> str:
-    signed = "signed (" + ", ".join(k["id"] for k in c["public_keys"]) + ")" if c["public_keys"] else "UNSIGNED"
     return (
-        f"{c['id']}: {c['status']}, {signed}, models={','.join(c['models']) or '*'}, "
+        f"{c['id']}: {c['status']}, ips={','.join(c['allowed_ips']) or 'any'}, models={','.join(c['models']) or '*'}, "
         f"rpm={c['rpm'] or '-'}, concurrency={c['max_concurrent'] or '-'}, expires={c.get('expires_at') or 'never'}"
     )
 
@@ -112,26 +97,19 @@ def _status(c: dict) -> str:
 def _handoff(admin: Admin, c: dict, token: str) -> str:
     base = admin.url + "/v1"
     models = ", ".join(c["models"]) or "all models"
-    if c["public_keys"]:
-        return f"""Send this to {c['id']} (the token is shown only once):
-
-  Base URL: {base}
-  API key:  {token}
-  Models:   {models}
-
-  from pxclient import signed_openai
-  client = signed_openai(base_url="{base}", api_key="<API key>", key_file="~/.pxkey/private.pem")
-
-The token only works together with their private key, so it is useless to anyone else."""
+    if c["allowed_ips"]:
+        where = f"It only works from {', '.join(c['allowed_ips'])}, so a leaked copy is useless elsewhere."
+    else:
+        where = "It works from any IP: anyone with a copy can use it until you revoke it (consider --allow-ips)."
     return f"""Send this to {c['id']} (the token is shown only once):
 
   Base URL: {base}
   API key:  {token}
   Models:   {models}
 
-  Works with any OpenAI SDK or tool (OPENAI_BASE_URL / OPENAI_API_KEY).
+  Works with any OpenAI SDK or tool: set OPENAI_BASE_URL and OPENAI_API_KEY.
 
-This token is UNSIGNED: anyone who gets a copy can use it until you revoke it."""
+{where}"""
 
 
 def _connect(args) -> Admin:
@@ -153,6 +131,7 @@ def main(argv=None, admin: Optional[Admin] = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def limits(p, create=False):
+        p.add_argument("--allow-ips", help="comma-separated IPs / CIDR ranges the token works from; '*' = any")
         p.add_argument("--models", help="comma-separated allow-list, prefix* globs; '*' = all")
         p.add_argument("--rpm", type=int, help="requests per minute (0 = unlimited)")
         p.add_argument("--burst", type=int)
@@ -162,9 +141,6 @@ def main(argv=None, admin: Optional[Admin] = None) -> int:
 
     p = sub.add_parser("add", help="create a user and print their token")
     p.add_argument("id")
-    g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--pubkey", help="the user's public key from `pxkey generate` (signed token)")
-    g.add_argument("--unsigned", action="store_true", help="plain bearer token, for tools that can't sign")
     limits(p, create=True)
     sub.add_parser("list", help="list users")
     p = sub.add_parser("show", help="show one user")
@@ -177,15 +153,6 @@ def main(argv=None, admin: Optional[Admin] = None) -> int:
     p.add_argument("--grace", help="how long the old token keeps working, e.g. 24h (default: revoke now)")
     for name, help_ in [("revoke", "disable immediately"), ("enable", "re-enable"), ("remove", "delete")]:
         sub.add_parser(name, help=help_).add_argument("id")
-    p = sub.add_parser("add-key", help="register another signing key for a user")
-    p.add_argument("id")
-    p.add_argument("--pubkey", required=True)
-    p.add_argument("--note", default="")
-    p.add_argument("--expires", default="")
-    p = sub.add_parser("remove-key", help="remove a signing key")
-    p.add_argument("id")
-    p.add_argument("key_id")
-    p.add_argument("--allow-unsigned", action="store_true", help="allow removing the last key (turns signing off)")
     args = ap.parse_args(argv)
 
     a = admin or _connect(args)
@@ -194,7 +161,7 @@ def main(argv=None, admin: Optional[Admin] = None) -> int:
             fields = _limits(args)
             if fields["max_concurrent"] is None:
                 fields["max_concurrent"] = 16
-            out = a.add(args.id, public_key=args.pubkey, unsigned=args.unsigned, **fields)
+            out = a.add(args.id, **fields)
             print(_handoff(a, out["client"], out["token"]), file=sys.stderr)
             print(out["token"])
         elif args.cmd == "list":
@@ -202,7 +169,7 @@ def main(argv=None, admin: Optional[Admin] = None) -> int:
             for c in clients:
                 print(_status(c))
             if not clients:
-                print("no users yet; create one with: pxadmin add ID --pubkey ed25519:...", file=sys.stderr)
+                print("no users yet; create one with: pxadmin add ID --allow-ips THEIR_IP", file=sys.stderr)
         elif args.cmd == "show":
             print(_status(a.show(args.id)))
         elif args.cmd == "set":
@@ -216,12 +183,6 @@ def main(argv=None, admin: Optional[Admin] = None) -> int:
         elif args.cmd == "remove":
             a.remove(args.id)
             print(f"removed {args.id}", file=sys.stderr)
-        elif args.cmd == "add-key":
-            out = a.add_key(args.id, args.pubkey, args.note, args.expires)
-            print(_status(out["client"]))
-        elif args.cmd == "remove-key":
-            a.remove_key(args.id, args.key_id, args.allow_unsigned)
-            print(f"removed key {args.key_id} from {args.id}", file=sys.stderr)
     except AdminError as e:
         print(f"error: {e.message}", file=sys.stderr)
         return 1

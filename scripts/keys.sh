@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 # Manage client tokens and the upstream key of a running deployment.
 #
-#   scripts/keys.sh add -id alice -pubkey ed25519:... -models gpt-4o-mini -concurrency 16 -expires 90d
-#   scripts/keys.sh add -id bot -unsigned -concurrency 4   # plain token, for tools that can't sign
+#   scripts/keys.sh add -id alice -allow-ips 203.0.113.7 -models gpt-4o-mini -concurrency 16 -expires 90d
 #   scripts/keys.sh list
 #   scripts/keys.sh set -id alice -concurrency 64
 #   scripts/keys.sh rotate -id alice -grace 24h
 #   scripts/keys.sh revoke -id alice        # immediate; undo with: enable -id alice
 #   scripts/keys.sh remove -id alice
-#   scripts/keys.sh add-key -id alice -pubkey ed25519:...   # require signed requests
-#   scripts/keys.sh remove-key -id alice -key-id k_...
 #   scripts/keys.sh upstream-key            # replace the provider's upstream key
 #   scripts/keys.sh admin-key               # enable the admin HTTP API / rotate its key
 #   scripts/keys.sh check TOKEN [MODEL]     # verify a client token end-to-end
@@ -24,7 +21,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 compose() { docker compose "$@"; }
 
 case ${1:-help} in
-add | list | rotate | revoke | enable | set | remove | add-key | remove-key)
+add | list | rotate | revoke | enable | set | remove)
 	compose run --rm --no-deps -T proxy token "$@"
 	;;
 
@@ -125,7 +122,7 @@ check)
 	;;
 
 help | -h | --help)
-	sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
 	;;
 
 *)

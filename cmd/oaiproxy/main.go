@@ -32,15 +32,13 @@ const usageText = `usage: oaiproxy <command> [flags]
 
 commands:
   serve                     run the proxy (configuration via environment)
-  token add -id ID -pubkey K   create a signed client and print its token once (-unsigned: plain token)
+  token add -id ID [...]    create a client and print its token once
   token list                list clients (never prints tokens)
   token rotate -id ID       issue a new token (-grace keeps the old one valid)
   token revoke -id ID       disable a client immediately
   token enable -id ID       re-enable a revoked client
   token set -id ID [...]    change models / limits / expiry
   token remove -id ID       delete a client
-  token add-key -id ID -pubkey KEY     require signed requests with this key
-  token remove-key -id ID -key-id K    remove a signing key
   healthcheck               exit 0 if the local server is healthy
   version                   print version
 
@@ -111,7 +109,7 @@ func serve() error {
 		Logger:            logger,
 		AccessLog:         access,
 		Metrics:           metrics,
-		SignatureMaxSkew:  cfg.SignatureMaxSkew,
+		TrustedProxies:    cfg.TrustedProxies,
 	})
 	if err != nil {
 		return err

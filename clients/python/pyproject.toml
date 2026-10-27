@@ -5,15 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pxclient"
 version = "0.1.0"
-description = "Request-signing client for the shellbench OpenAI-compatible proxy"
+description = "Admin CLI (pxadmin) for the shellbench OpenAI-compatible gateway"
 requires-python = ">=3.9"
-dependencies = ["httpx>=0.25", "cryptography>=41"]
-
-[project.optional-dependencies]
-openai = ["openai>=1.40"]
+dependencies = ["httpx>=0.25"]
 
 [project.scripts]
-pxkey = "pxclient.cli:main"
 pxadmin = "pxclient.admin:main"
 
 [tool.setuptools]

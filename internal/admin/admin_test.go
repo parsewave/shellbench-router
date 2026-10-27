@@ -2,7 +2,6 @@ package admin
 
 import (
 	"bytes"
-	"crypto/ed25519"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -85,12 +84,6 @@ func (e *env) authenticate(tok string) (*tokens.Principal, error) {
 	return tokens.NewStore(f).Authenticate(tok, time.Now())
 }
 
-func pubKey(seed byte) string {
-	s := make([]byte, ed25519.SeedSize)
-	s[0] = seed
-	return tokens.FormatPublicKey(ed25519.NewKeyFromSeed(s).Public().(ed25519.PublicKey))
-}
-
 func TestDisabledAndAuth(t *testing.T) {
 	off := newEnv(t, "")
 	if st, out := off.call("GET", "/admin/clients", adminKey, ""); st != 404 || errorCode(out) != "unknown_url" {
@@ -119,7 +112,7 @@ func TestDisabledAndAuth(t *testing.T) {
 
 func TestClientLifecycle(t *testing.T) {
 	e := newEnv(t, adminKey)
-	st, out := e.call("POST", "/admin/clients", adminKey, `{"id":"alice","unsigned":true,"models":["gpt-4o","o3*"],"rpm":600,"max_concurrent":32,"expires":"90d","note":"bench"}`)
+	st, out := e.call("POST", "/admin/clients", adminKey, `{"id":"alice","models":["gpt-4o","o3*"],"rpm":600,"max_concurrent":32,"expires":"90d","note":"bench"}`)
 	if st != 201 {
 		t.Fatalf("create: %d %v", st, out)
 	}
@@ -131,7 +124,7 @@ func TestClientLifecycle(t *testing.T) {
 		t.Fatal("token logged")
 	}
 	c := out["client"].(map[string]any)
-	if c["status"] != "active" || c["max_concurrent"].(float64) != 32 || c["signature_required"] != false {
+	if c["status"] != "active" || c["max_concurrent"].(float64) != 32 || len(c["allowed_ips"].([]any)) != 0 {
 		t.Fatalf("client view %v", c)
 	}
 	p, err := e.authenticate(tok)
@@ -142,7 +135,7 @@ func TestClientLifecycle(t *testing.T) {
 		t.Fatal("no reload after create")
 	}
 
-	if st, out := e.call("POST", "/admin/clients", adminKey, `{"id":"alice","unsigned":true}`); st != 409 || errorCode(out) != "already_exists" {
+	if st, out := e.call("POST", "/admin/clients", adminKey, `{"id":"alice"}`); st != 409 || errorCode(out) != "already_exists" {
 		t.Fatalf("duplicate: %d %v", st, out)
 	}
 	if st, out := e.call("GET", "/admin/clients/alice", adminKey, ""); st != 200 || out["id"] != "alice" {
@@ -194,59 +187,39 @@ func TestClientLifecycle(t *testing.T) {
 	}
 }
 
-func TestSigningKeys(t *testing.T) {
+func TestAllowedIPs(t *testing.T) {
 	e := newEnv(t, adminKey)
-	// Keys are registered at creation time ("public_key" shorthand or a list).
-	if st, out := e.call("POST", "/admin/clients", adminKey, `{"id":"sue","public_key":"`+pubKey(9)+`"}`); st != 201 || out["client"].(map[string]any)["signature_required"] != true {
-		t.Fatalf("create with public_key: %d %v", st, out)
+	st, out := e.call("POST", "/admin/clients", adminKey, `{"id":"ci","allowed_ips":["203.0.113.7","10.0.0.0/8"]}`)
+	if st != 201 {
+		t.Fatalf("create: %d %v", st, out)
 	}
-	st, out := e.call("POST", "/admin/clients", adminKey, `{"id":"sam","max_concurrent":4,"public_keys":[{"public_key":"`+pubKey(1)+`","note":"ci"}]}`)
-	if st != 201 || out["client"].(map[string]any)["signature_required"] != true {
-		t.Fatalf("create with key: %d %v", st, out)
+	if ips := out["client"].(map[string]any)["allowed_ips"].([]any); len(ips) != 2 {
+		t.Fatalf("allowed_ips %v", ips)
 	}
 	p, _ := e.authenticate(out["token"].(string))
-	if !p.SignatureRequired() {
-		t.Fatal("principal does not require signature")
+	if len(p.AllowedIPs) != 2 {
+		t.Fatalf("principal %+v", p)
 	}
-	k1 := out["client"].(map[string]any)["public_keys"].([]any)[0].(map[string]any)["id"].(string)
-
-	st, out = e.call("POST", "/admin/clients/sam/keys", adminKey, `{"public_key":"`+pubKey(2)+`","expires":"30d"}`)
-	if st != 201 {
-		t.Fatalf("add key: %d %v", st, out)
+	if st, out := e.call("PATCH", "/admin/clients/ci", adminKey, `{"allowed_ips":["*"]}`); st != 200 || len(out["allowed_ips"].([]any)) != 0 {
+		t.Fatalf("clear: %d %v", st, out)
 	}
-	k2 := out["key"].(map[string]any)["id"].(string)
-	if st, out := e.call("POST", "/admin/clients/sam/keys", adminKey, `{"public_key":"`+pubKey(2)+`"}`); st != 409 {
-		t.Fatalf("duplicate key: %d %v", st, out)
+	if st, out := e.call("PATCH", "/admin/clients/ci", adminKey, `{"allowed_ips":["nope"]}`); st != 400 {
+		t.Fatalf("invalid ip: %d %v", st, out)
 	}
-	if st, out := e.call("POST", "/admin/clients/sam/keys", adminKey, `{"public_key":"ed25519:AAAA"}`); st != 400 {
-		t.Fatalf("bad key: %d %v", st, out)
-	}
-
-	if st, _ := e.call("DELETE", "/admin/clients/sam/keys/"+k1, adminKey, ""); st != 204 {
-		t.Fatalf("remove key: %d", st)
-	}
-	if st, out := e.call("DELETE", "/admin/clients/sam/keys/"+k2, adminKey, ""); st != 409 || errorCode(out) != "last_signing_key" {
-		t.Fatalf("remove last key: %d %v", st, out)
-	}
-	if st, _ := e.call("DELETE", "/admin/clients/sam/keys/"+k2+"?allow_unsigned=true", adminKey, ""); st != 204 {
-		t.Fatalf("remove last key with allow_unsigned: %d", st)
-	}
-	if st, out := e.call("GET", "/admin/clients/sam", adminKey, ""); out["signature_required"] != false {
-		t.Fatalf("after removing keys: %d %v", st, out)
+	if st, out := e.call("GET", "/admin/clients/ci", adminKey, ""); len(out["allowed_ips"].([]any)) != 0 {
+		t.Fatalf("failed patch applied: %d %v", st, out)
 	}
 }
 
 func TestBadRequests(t *testing.T) {
 	e := newEnv(t, adminKey)
 	cases := []struct{ method, path, body, code string }{
-		{"POST", "/admin/clients", `{"id":"a"}`, "public_key_required"},
-		{"POST", "/admin/clients", `{"id":"a","unsigned":true,"public_key":"` + pubKey(1) + `"}`, "invalid_request"},
-		{"POST", "/admin/clients", `{"id":"bad id","unsigned":true}`, "invalid_request"},
+		{"POST", "/admin/clients", `{"id":"a","allowed_ips":["1.2.3.4/40"]}`, "invalid_request"},
+		{"POST", "/admin/clients", `{"id":"bad id"}`, "invalid_request"},
 		{"POST", "/admin/clients", `{"id":"a","unknown":1}`, "invalid_json"},
-		{"POST", "/admin/clients", `{"id":"a","unsigned":true,"expires":"soon"}`, "invalid_request"},
-		{"POST", "/admin/clients", `{"id":"a","unsigned":true,"models":["has space"]}`, "invalid_request"},
+		{"POST", "/admin/clients", `{"id":"a","expires":"soon"}`, "invalid_request"},
+		{"POST", "/admin/clients", `{"id":"a","models":["has space"]}`, "invalid_request"},
 		{"POST", "/admin/clients", `not json`, "invalid_json"},
-		{"POST", "/admin/clients", `{"id":"a","public_keys":[{"public_key":"nope"}]}`, "invalid_request"},
 		{"POST", "/admin/clients", `{"id":"a","x":"` + strings.Repeat("a", 70<<10) + `"}`, "request_too_large"},
 		{"POST", "/admin/clients/nobody/rotate", ``, "not_found"},
 		{"PATCH", "/admin/clients/nobody", `{}`, "not_found"},

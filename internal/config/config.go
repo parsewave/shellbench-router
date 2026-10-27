@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -44,8 +45,8 @@ type Config struct {
 	UpstreamProject   string
 	UpstreamHeaders   http.Header
 	Key               *UpstreamKey
-	AdminKey          *UpstreamKey // nil = admin API disabled
-	SignatureMaxSkew  time.Duration
+	AdminKey          *UpstreamKey   // nil = admin API disabled
+	TrustedProxies    []netip.Prefix // nil = proxy.DefaultTrustedProxies
 	Routes            []string
 	MaxRequestBytes   int64
 	MaxRetries        int
@@ -83,7 +84,6 @@ func Load() (*Config, error) {
 		LogFormat:         str("LOG_FORMAT", "json"),
 		LogLevel:          str("LOG_LEVEL", "info"),
 		AccessLogFile:     str("ACCESS_LOG_FILE", ""),
-		SignatureMaxSkew:  dur("SIGNATURE_MAX_SKEW", 2*time.Minute, &errs),
 	}
 
 	var err error
@@ -133,8 +133,18 @@ func Load() (*Config, error) {
 			errs = append(errs, errors.New("admin API key must be at least 32 characters (generate one with scripts/keys.sh admin-key)"))
 		}
 	}
-	if c.SignatureMaxSkew < 10*time.Second || c.SignatureMaxSkew > time.Hour {
-		errs = append(errs, errors.New("SIGNATURE_MAX_SKEW must be between 10s and 1h"))
+	if v := str("TRUSTED_PROXIES", ""); v != "" {
+		for _, s := range strings.Split(v, ",") {
+			if s = strings.TrimSpace(s); s == "" {
+				continue
+			}
+			p, err := netip.ParsePrefix(s)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("TRUSTED_PROXIES: invalid CIDR %q", s))
+				continue
+			}
+			c.TrustedProxies = append(c.TrustedProxies, p.Masked())
+		}
 	}
 	return c, errors.Join(errs...)
 }
