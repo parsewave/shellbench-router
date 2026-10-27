@@ -36,6 +36,9 @@ var DefaultRoutes = []string{
 	"POST /v1/embeddings",
 	"POST /v1/completions",
 	"POST /v1/moderations",
+	// Anthropic Messages API (Claude Code, Anthropic SDKs).
+	"POST /v1/messages",
+	"POST /v1/messages/count_tokens",
 }
 
 type Config struct {
