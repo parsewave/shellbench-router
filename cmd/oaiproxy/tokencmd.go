@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"strconv"
 	"strings"
@@ -17,10 +16,11 @@ import (
 
 // tokenCmd implements "oaiproxy token ...". Tokens are printed to stdout
 // (exactly once, at creation/rotation) and everything else to stderr, so
-// `TOKEN=$(oaiproxy token add -id alice)` captures only the secret.
+// `TOKEN=$(oaiproxy token add -id alice)` captures only the secret. Changes
+// go through tokens.Update, so they never race the admin API or each other.
 func tokenCmd(args []string, stdout, stderr io.Writer, now time.Time) error {
 	if len(args) == 0 {
-		return errors.New("token: missing subcommand (add, list, rotate, revoke, enable, set, remove)")
+		return errors.New("token: missing subcommand (add, list, rotate, revoke, enable, set, remove, add-key, remove-key)")
 	}
 	sub, args := args[0], args[1:]
 	flags := flag.NewFlagSet("token "+sub, flag.ContinueOnError)
@@ -31,35 +31,31 @@ func tokenCmd(args []string, stdout, stderr io.Writer, now time.Time) error {
 	rpm := flags.Int("rpm", 0, "requests per minute (0 = unlimited)")
 	burst := flags.Int("burst", 0, "rate-limit burst (0 = same as rpm)")
 	conc := flags.Int("concurrency", 0, "max concurrent requests (0 = unlimited)")
-	expires := flags.String("expires", "", "client expiry: duration (90d, 12h), date (2027-01-31), RFC3339, or never")
+	expires := flags.String("expires", "", "expiry: duration (90d, 12h), date (2027-01-31), RFC3339, or never")
 	note := flags.String("note", "", "free-form note")
 	grace := flags.String("grace", "0", "rotate: how long the old token stays valid (0 = revoke now)")
+	pubkey := flags.String("pubkey", "", "add/add-key: Ed25519 public key (ed25519:<base64> or PEM); requires signed requests")
+	keyID := flags.String("key-id", "", "remove-key: id of the signing key (see list)")
+	allowUnsigned := flags.Bool("allow-unsigned", false, "remove-key: allow removing the last key, turning signing off")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	set := map[string]bool{}
 	flags.Visit(func(f *flag.Flag) { set[f.Name] = true })
 
-	f, err := tokens.Read(*file)
-	if errors.Is(err, fs.ErrNotExist) && sub == "add" {
-		f, err = &tokens.File{Version: 1}, nil
-	}
-	if err != nil {
-		return err
-	}
-	if sub != "list" && *id == "" {
-		return errors.New("-id is required")
-	}
-
-	var c *tokens.Client
-	if sub != "list" && sub != "add" {
-		if c = f.Find(*id); c == nil {
-			return fmt.Errorf("client %q not found", *id)
+	if sub == "list" {
+		f, err := tokens.Read(*file)
+		if err != nil {
+			return err
 		}
+		return listClients(stdout, f, now)
+	}
+	if *id == "" {
+		return errors.New("-id is required")
 	}
 	apply := func(c *tokens.Client) error {
 		if set["models"] {
-			c.Models = parseModels(*models)
+			c.Models = tokens.ParseModels(*models)
 		}
 		if set["rpm"] {
 			c.RPM = *rpm
@@ -73,131 +69,134 @@ func tokenCmd(args []string, stdout, stderr io.Writer, now time.Time) error {
 		if set["note"] {
 			c.Note = *note
 		}
-		if set["expires"] {
-			t, err := parseExpiry(*expires, now)
+		if set["expires"] && sub != "add-key" {
+			t, err := tokens.ParseExpiry(*expires, now)
 			if err != nil {
-				return err
+				return fmt.Errorf("-expires: %w", err)
 			}
 			c.ExpiresAt = t
 		}
 		return nil
 	}
-
-	switch sub {
-	case "list":
-		tw := tabwriter.NewWriter(stdout, 0, 2, 2, ' ', 0)
-		fmt.Fprintln(tw, "ID\tSTATUS\tMODELS\tRPM\tBURST\tCONCURRENCY\tEXPIRES\tSECRETS")
-		for _, c := range f.Clients {
-			var hints []string
-			for _, s := range c.Secrets {
-				h := s.Hint
-				if s.ExpiresAt != nil {
-					h += " (until " + s.ExpiresAt.Format(time.RFC3339) + ")"
-				}
-				hints = append(hints, h)
-			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", c.ID, c.Status(now), orAll(c.Models), limit(c.RPM), limit(c.Burst), limit(c.MaxConcurrent), fmtTime(c.ExpiresAt), strings.Join(hints, ", "))
+	find := func(f *tokens.File) (*tokens.Client, error) {
+		if c := f.Find(*id); c != nil {
+			return c, nil
 		}
-		return tw.Flush()
-	case "add":
-		nc := tokens.Client{ID: *id}
-		if err := apply(&nc); err != nil {
-			return err
-		}
-		tok, err := f.Add(nc, now)
-		if err != nil {
-			return err
-		}
-		if err := tokens.Write(*file, f); err != nil {
-			return err
-		}
-		fmt.Fprintf(stderr, "Created client %q. Its token is printed below exactly once; store it securely.\n", *id)
-		fmt.Fprintln(stdout, tok)
-		return nil
-	case "rotate":
-		g, err := parseDuration(*grace)
-		if err != nil {
-			return fmt.Errorf("-grace: %w", err)
-		}
-		tok, err := f.Rotate(*id, g, now)
-		if err != nil {
-			return err
-		}
-		if err := tokens.Write(*file, f); err != nil {
-			return err
-		}
-		if g > 0 {
-			fmt.Fprintf(stderr, "Rotated %q; previous token(s) remain valid for %s.\n", *id, g)
-		} else {
-			fmt.Fprintf(stderr, "Rotated %q; previous token(s) revoked.\n", *id)
-		}
-		fmt.Fprintln(stdout, tok)
-		return nil
-	case "revoke", "enable":
-		c.Disabled = sub == "revoke"
-	case "set":
-		if err := apply(c); err != nil {
-			return err
-		}
-	case "remove":
-		if err := f.Remove(*id); err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("token: unknown subcommand %q", sub)
+		return nil, fmt.Errorf("client %q %w", *id, tokens.ErrNotFound)
 	}
-	if err := tokens.Write(*file, f); err != nil {
+
+	var tok, msg string
+	err := tokens.Update(*file, sub == "add", func(f *tokens.File) error {
+		switch sub {
+		case "add":
+			nc := tokens.Client{ID: *id}
+			if err := apply(&nc); err != nil {
+				return err
+			}
+			var err error
+			if tok, err = f.Add(nc, now); err != nil {
+				return err
+			}
+			msg = fmt.Sprintf("Created client %q. Its token is printed below exactly once; store it securely.", *id)
+			if *pubkey != "" {
+				k, err := f.AddKey(*id, *pubkey, "", nil, now)
+				if err != nil {
+					return err
+				}
+				msg += fmt.Sprintf("\nSigning key %s registered: requests must be signed.", k.ID)
+			}
+		case "rotate":
+			g, err := tokens.ParseDuration(*grace)
+			if err != nil {
+				return fmt.Errorf("-grace: %w", err)
+			}
+			if tok, err = f.Rotate(*id, g, now); err != nil {
+				return err
+			}
+			if g > 0 {
+				msg = fmt.Sprintf("Rotated %q; previous token(s) remain valid for %s.", *id, g)
+			} else {
+				msg = fmt.Sprintf("Rotated %q; previous token(s) revoked.", *id)
+			}
+		case "revoke", "enable":
+			c, err := find(f)
+			if err != nil {
+				return err
+			}
+			c.Disabled = sub == "revoke"
+		case "set":
+			c, err := find(f)
+			if err != nil {
+				return err
+			}
+			if err := apply(c); err != nil {
+				return err
+			}
+		case "remove":
+			return f.Remove(*id)
+		case "add-key":
+			if *pubkey == "" {
+				return errors.New("-pubkey is required")
+			}
+			exp, err := tokens.ParseExpiry(*expires, now)
+			if err != nil {
+				return fmt.Errorf("-expires: %w", err)
+			}
+			k, err := f.AddKey(*id, *pubkey, *note, exp, now)
+			if err != nil {
+				return err
+			}
+			msg = fmt.Sprintf("Registered signing key %s for %q; its requests must now be signed.", k.ID, *id)
+		case "remove-key":
+			if *keyID == "" {
+				return errors.New("-key-id is required")
+			}
+			if err := f.RemoveKey(*id, *keyID, *allowUnsigned); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("token: unknown subcommand %q", sub)
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stderr, "Updated %q (%s). The running server reloads within seconds.\n", *id, sub)
+	if msg == "" {
+		msg = fmt.Sprintf("Updated %q (%s). The running server reloads within seconds.", *id, sub)
+	}
+	fmt.Fprintln(stderr, msg)
+	if tok != "" {
+		fmt.Fprintln(stdout, tok)
+	}
 	return nil
 }
 
-func parseModels(s string) []string {
-	var out []string
-	for _, m := range strings.Split(s, ",") {
-		if m = strings.TrimSpace(m); m != "" {
-			if m == "*" {
-				return nil
+func listClients(stdout io.Writer, f *tokens.File, now time.Time) error {
+	tw := tabwriter.NewWriter(stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "ID\tSTATUS\tMODELS\tRPM\tBURST\tCONCURRENCY\tEXPIRES\tSECRETS\tSIGNING KEYS")
+	for _, c := range f.Clients {
+		var hints, keys []string
+		for _, s := range c.Secrets {
+			h := s.Hint
+			if s.ExpiresAt != nil {
+				h += " (until " + s.ExpiresAt.Format(time.RFC3339) + ")"
 			}
-			out = append(out, m)
+			hints = append(hints, h)
 		}
-	}
-	return out
-}
-
-func parseExpiry(s string, now time.Time) (*time.Time, error) {
-	switch s = strings.TrimSpace(s); s {
-	case "", "never":
-		return nil, nil
-	}
-	if d, err := parseDuration(s); err == nil {
-		t := now.UTC().Add(d).Truncate(time.Second)
-		return &t, nil
-	}
-	for _, layout := range []string{time.RFC3339, "2006-01-02"} {
-		if t, err := time.Parse(layout, s); err == nil {
-			t = t.UTC()
-			return &t, nil
+		for _, k := range c.PublicKeys {
+			kk := k.ID
+			if k.ExpiresAt != nil {
+				kk += " (until " + k.ExpiresAt.Format(time.RFC3339) + ")"
+			}
+			keys = append(keys, kk)
 		}
-	}
-	return nil, fmt.Errorf("-expires: cannot parse %q", s)
-}
-
-// parseDuration extends time.ParseDuration with a "d" (day) suffix.
-func parseDuration(s string) (time.Duration, error) {
-	if n, ok := strings.CutSuffix(s, "d"); ok {
-		days, err := strconv.Atoi(n)
-		if err != nil || days < 0 {
-			return 0, fmt.Errorf("invalid duration %q", s)
+		if len(keys) == 0 {
+			keys = []string{"- (unsigned)"}
 		}
-		return time.Duration(days) * 24 * time.Hour, nil
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", c.ID, c.Status(now), orAll(c.Models), limit(c.RPM), limit(c.Burst), limit(c.MaxConcurrent), fmtTime(c.ExpiresAt), strings.Join(hints, ", "), strings.Join(keys, ", "))
 	}
-	d, err := time.ParseDuration(s)
-	if err != nil || d < 0 {
-		return 0, fmt.Errorf("invalid duration %q", s)
-	}
-	return d, nil
+	return tw.Flush()
 }
 
 func envOr(k, def string) string {

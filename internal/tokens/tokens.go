@@ -22,6 +22,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"oaiproxy/internal/signing"
 )
 
 // Prefix marks proxy tokens so they are easy to recognise in secret scanners.
@@ -46,6 +48,10 @@ type Client struct {
 	Burst         int        `json:"burst,omitempty"`          // token-bucket size, 0 = RPM
 	MaxConcurrent int        `json:"max_concurrent,omitempty"` // in-flight requests, 0 = unlimited
 	Secrets       []Secret   `json:"secrets"`
+	// PublicKeys are Ed25519 request-signing keys. A client with at least
+	// one key must sign every request (see internal/signing) in addition to
+	// presenting its bearer token, so a leaked token alone is useless.
+	PublicKeys []PublicKey `json:"public_keys,omitempty"`
 }
 
 // Secret is one valid credential for a client. Several may be valid at once
@@ -130,6 +136,7 @@ func (f *File) Validate() error {
 	}
 	ids := map[string]bool{}
 	hashes := map[string]bool{}
+	keys := map[string]bool{}
 	for _, c := range f.Clients {
 		if !idRE.MatchString(c.ID) {
 			return fmt.Errorf("invalid client id %q (allowed: letters, digits, _ . -, max 64)", c.ID)
@@ -157,6 +164,22 @@ func (f *File) Validate() error {
 			}
 			hashes[h] = true
 		}
+		if len(c.PublicKeys) > MaxPublicKeys {
+			return fmt.Errorf("client %q: at most %d public keys", c.ID, MaxPublicKeys)
+		}
+		for _, k := range c.PublicKeys {
+			pub, err := ParsePublicKey(k.Key)
+			if err != nil {
+				return fmt.Errorf("client %q: public key %q: %w", c.ID, k.ID, err)
+			}
+			if k.ID != KeyID(pub) {
+				return fmt.Errorf("client %q: public key id %q does not match its key (want %q)", c.ID, k.ID, KeyID(pub))
+			}
+			if keys[k.ID] {
+				return fmt.Errorf("client %q: duplicate public key %q", c.ID, k.ID)
+			}
+			keys[k.ID] = true
+		}
 	}
 	return nil
 }
@@ -174,7 +197,7 @@ func (f *File) Find(id string) *Client {
 // Add creates a client with a fresh secret and returns the plaintext token.
 func (f *File) Add(c Client, now time.Time) (string, error) {
 	if f.Find(c.ID) != nil {
-		return "", fmt.Errorf("client %q already exists", c.ID)
+		return "", fmt.Errorf("client %q %w", c.ID, ErrExists)
 	}
 	tok, s, err := Generate(now)
 	if err != nil {
@@ -190,7 +213,7 @@ func (f *File) Add(c Client, now time.Time) (string, error) {
 func (f *File) Rotate(id string, grace time.Duration, now time.Time) (string, error) {
 	c := f.Find(id)
 	if c == nil {
-		return "", fmt.Errorf("client %q not found", id)
+		return "", fmt.Errorf("client %q %w", id, ErrNotFound)
 	}
 	tok, s, err := Generate(now)
 	if err != nil {
@@ -219,7 +242,7 @@ func (f *File) Remove(id string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("client %q not found", id)
+	return fmt.Errorf("client %q %w", id, ErrNotFound)
 }
 
 // Status describes a client's effective state at now.
@@ -238,6 +261,12 @@ func (c *Client) Status(now time.Time) string {
 	return "no-valid-secret"
 }
 
+// Lookup errors returned (wrapped) by File methods.
+var (
+	ErrNotFound = errors.New("not found")
+	ErrExists   = errors.New("already exists")
+)
+
 // Authentication failures. Clients receive the same generic 401 for all of
 // them; the distinction is only logged.
 var (
@@ -254,7 +283,13 @@ type Principal struct {
 	RPM           int
 	Burst         int
 	MaxConcurrent int
+	// Keys are the client's request-signing keys; non-empty means every
+	// request must carry a valid signature from one of them.
+	Keys []signing.Key
 }
+
+// SignatureRequired reports whether requests must be signed.
+func (p *Principal) SignatureRequired() bool { return len(p.Keys) > 0 }
 
 // Restricted reports whether the client has a model allow-list.
 func (p *Principal) Restricted() bool {
@@ -303,6 +338,10 @@ func NewStore(f *File) *Store {
 	s := &Store{}
 	for _, c := range f.Clients {
 		p := &Principal{ID: c.ID, Models: append([]string(nil), c.Models...), RPM: c.RPM, Burst: c.Burst, MaxConcurrent: c.MaxConcurrent}
+		for _, k := range c.PublicKeys {
+			pub, _ := ParsePublicKey(k.Key) // validated by File.Validate
+			p.Keys = append(p.Keys, signing.Key{ID: k.ID, Pub: pub, ExpiresAt: k.ExpiresAt})
+		}
 		s.ids = append(s.ids, c.ID)
 		for _, sec := range c.Secrets {
 			var h [sha256.Size]byte
