@@ -32,7 +32,7 @@ const usageText = `usage: oaiproxy <command> [flags]
 
 commands:
   serve                     run the proxy (configuration via environment)
-  token add -id ID [...]    create a client and print its token once
+  token add -id ID -pubkey K   create a signed client and print its token once (-unsigned: plain token)
   token list                list clients (never prints tokens)
   token rotate -id ID       issue a new token (-grace keeps the old one valid)
   token revoke -id ID       disable a client immediately

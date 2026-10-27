@@ -119,7 +119,7 @@ func TestDisabledAndAuth(t *testing.T) {
 
 func TestClientLifecycle(t *testing.T) {
 	e := newEnv(t, adminKey)
-	st, out := e.call("POST", "/admin/clients", adminKey, `{"id":"alice","models":["gpt-4o","o3*"],"rpm":600,"max_concurrent":32,"expires":"90d","note":"bench"}`)
+	st, out := e.call("POST", "/admin/clients", adminKey, `{"id":"alice","unsigned":true,"models":["gpt-4o","o3*"],"rpm":600,"max_concurrent":32,"expires":"90d","note":"bench"}`)
 	if st != 201 {
 		t.Fatalf("create: %d %v", st, out)
 	}
@@ -142,7 +142,7 @@ func TestClientLifecycle(t *testing.T) {
 		t.Fatal("no reload after create")
 	}
 
-	if st, out := e.call("POST", "/admin/clients", adminKey, `{"id":"alice"}`); st != 409 || errorCode(out) != "already_exists" {
+	if st, out := e.call("POST", "/admin/clients", adminKey, `{"id":"alice","unsigned":true}`); st != 409 || errorCode(out) != "already_exists" {
 		t.Fatalf("duplicate: %d %v", st, out)
 	}
 	if st, out := e.call("GET", "/admin/clients/alice", adminKey, ""); st != 200 || out["id"] != "alice" {
@@ -196,7 +196,10 @@ func TestClientLifecycle(t *testing.T) {
 
 func TestSigningKeys(t *testing.T) {
 	e := newEnv(t, adminKey)
-	// Keys can be registered at creation time.
+	// Keys are registered at creation time ("public_key" shorthand or a list).
+	if st, out := e.call("POST", "/admin/clients", adminKey, `{"id":"sue","public_key":"`+pubKey(9)+`"}`); st != 201 || out["client"].(map[string]any)["signature_required"] != true {
+		t.Fatalf("create with public_key: %d %v", st, out)
+	}
 	st, out := e.call("POST", "/admin/clients", adminKey, `{"id":"sam","max_concurrent":4,"public_keys":[{"public_key":"`+pubKey(1)+`","note":"ci"}]}`)
 	if st != 201 || out["client"].(map[string]any)["signature_required"] != true {
 		t.Fatalf("create with key: %d %v", st, out)
@@ -236,10 +239,12 @@ func TestSigningKeys(t *testing.T) {
 func TestBadRequests(t *testing.T) {
 	e := newEnv(t, adminKey)
 	cases := []struct{ method, path, body, code string }{
-		{"POST", "/admin/clients", `{"id":"bad id"}`, "invalid_request"},
+		{"POST", "/admin/clients", `{"id":"a"}`, "public_key_required"},
+		{"POST", "/admin/clients", `{"id":"a","unsigned":true,"public_key":"` + pubKey(1) + `"}`, "invalid_request"},
+		{"POST", "/admin/clients", `{"id":"bad id","unsigned":true}`, "invalid_request"},
 		{"POST", "/admin/clients", `{"id":"a","unknown":1}`, "invalid_json"},
-		{"POST", "/admin/clients", `{"id":"a","expires":"soon"}`, "invalid_request"},
-		{"POST", "/admin/clients", `{"id":"a","models":["has space"]}`, "invalid_request"},
+		{"POST", "/admin/clients", `{"id":"a","unsigned":true,"expires":"soon"}`, "invalid_request"},
+		{"POST", "/admin/clients", `{"id":"a","unsigned":true,"models":["has space"]}`, "invalid_request"},
 		{"POST", "/admin/clients", `not json`, "invalid_json"},
 		{"POST", "/admin/clients", `{"id":"a","public_keys":[{"public_key":"nope"}]}`, "invalid_request"},
 		{"POST", "/admin/clients", `{"id":"a","x":"` + strings.Repeat("a", 70<<10) + `"}`, "request_too_large"},

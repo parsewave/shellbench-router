@@ -34,7 +34,8 @@ func tokenCmd(args []string, stdout, stderr io.Writer, now time.Time) error {
 	expires := flags.String("expires", "", "expiry: duration (90d, 12h), date (2027-01-31), RFC3339, or never")
 	note := flags.String("note", "", "free-form note")
 	grace := flags.String("grace", "0", "rotate: how long the old token stays valid (0 = revoke now)")
-	pubkey := flags.String("pubkey", "", "add/add-key: Ed25519 public key (ed25519:<base64> or PEM); requires signed requests")
+	pubkey := flags.String("pubkey", "", "add/add-key: the user's Ed25519 public key (ed25519:<base64> from `pxkey generate`, or PEM)")
+	unsigned := flags.Bool("unsigned", false, "add: create a plain bearer token without request signing (for tools that can't sign)")
 	keyID := flags.String("key-id", "", "remove-key: id of the signing key (see list)")
 	allowUnsigned := flags.Bool("allow-unsigned", false, "remove-key: allow removing the last key, turning signing off")
 	if err := flags.Parse(args); err != nil {
@@ -89,6 +90,12 @@ func tokenCmd(args []string, stdout, stderr io.Writer, now time.Time) error {
 	err := tokens.Update(*file, sub == "add", func(f *tokens.File) error {
 		switch sub {
 		case "add":
+			if *pubkey == "" && !*unsigned {
+				return errSignedDefault
+			}
+			if *pubkey != "" && *unsigned {
+				return errors.New("-pubkey and -unsigned are mutually exclusive")
+			}
 			nc := tokens.Client{ID: *id}
 			if err := apply(&nc); err != nil {
 				return err
@@ -104,6 +111,8 @@ func tokenCmd(args []string, stdout, stderr io.Writer, now time.Time) error {
 					return err
 				}
 				msg += fmt.Sprintf("\nSigning key %s registered: requests must be signed.", k.ID)
+			} else {
+				msg += "\nUnsigned: this token alone grants access, so treat it like a password."
 			}
 		case "rotate":
 			g, err := tokens.ParseDuration(*grace)
@@ -171,6 +180,10 @@ func tokenCmd(args []string, stdout, stderr io.Writer, now time.Time) error {
 	}
 	return nil
 }
+
+// errSignedDefault explains the default: tokens are tied to the user's key.
+var errSignedDefault = errors.New("signed tokens are the default: pass -pubkey ed25519:... (the user gets it from `pxkey generate`), " +
+	"or -unsigned for a plain bearer token (only for tools that can't sign)")
 
 func listClients(stdout io.Writer, f *tokens.File, now time.Time) error {
 	tw := tabwriter.NewWriter(stdout, 0, 2, 2, ' ', 0)

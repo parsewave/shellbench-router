@@ -6,7 +6,7 @@
 // (ADMIN_API_KEY_FILE); without one the API is disabled and /admin/ is 404.
 //
 //	GET    /admin/clients                     list clients
-//	POST   /admin/clients                     create; returns the token once
+//	POST   /admin/clients                     create (needs "public_key", or "unsigned": true); returns the token once
 //	GET    /admin/clients/{id}                show one client
 //	PATCH  /admin/clients/{id}                change models, limits, expiry, note
 //	DELETE /admin/clients/{id}                delete
@@ -192,19 +192,35 @@ type keyRequest struct {
 }
 
 type createRequest struct {
-	ID            string       `json:"id"`
-	Models        []string     `json:"models"`
-	RPM           int          `json:"rpm"`
-	Burst         int          `json:"burst"`
-	MaxConcurrent int          `json:"max_concurrent"`
-	Expires       string       `json:"expires"`
-	Note          string       `json:"note"`
-	PublicKeys    []keyRequest `json:"public_keys"` // optional: require signing from the start
+	ID            string   `json:"id"`
+	Models        []string `json:"models"`
+	RPM           int      `json:"rpm"`
+	Burst         int      `json:"burst"`
+	MaxConcurrent int      `json:"max_concurrent"`
+	Expires       string   `json:"expires"`
+	Note          string   `json:"note"`
+	// Signed is the default: give the user's public key (or several), or
+	// set Unsigned for a plain bearer token.
+	PublicKey  string       `json:"public_key"`
+	PublicKeys []keyRequest `json:"public_keys"`
+	Unsigned   bool         `json:"unsigned"`
 }
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	var req createRequest
 	if !s.decode(w, r, &req) {
+		return
+	}
+	if req.PublicKey != "" {
+		req.PublicKeys = append([]keyRequest{{PublicKey: req.PublicKey}}, req.PublicKeys...)
+	}
+	switch {
+	case len(req.PublicKeys) == 0 && !req.Unsigned:
+		writeError(w, http.StatusBadRequest, "public_key_required",
+			`Signed tokens are the default: send the user's "public_key" (from `+"`pxkey generate`"+`), or "unsigned": true for a plain bearer token.`)
+		return
+	case len(req.PublicKeys) > 0 && req.Unsigned:
+		writeError(w, http.StatusBadRequest, "invalid_request", `"unsigned" can't be combined with public keys.`)
 		return
 	}
 	now := s.Now()

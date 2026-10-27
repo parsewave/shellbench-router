@@ -14,6 +14,7 @@ openai = ["openai>=1.40"]
 
 [project.scripts]
 pxkey = "pxclient.cli:main"
+pxadmin = "pxclient.admin:main"
 
 [tool.setuptools]
 packages = ["pxclient"]

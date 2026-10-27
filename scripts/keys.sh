@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Manage client tokens and the upstream key of a running deployment.
 #
-#   scripts/keys.sh add -id alice -models gpt-4o-mini,o3* -rpm 600 -concurrency 32 -expires 90d
+#   scripts/keys.sh add -id alice -pubkey ed25519:... -models gpt-4o-mini -concurrency 16 -expires 90d
+#   scripts/keys.sh add -id bot -unsigned -concurrency 4   # plain token, for tools that can't sign
 #   scripts/keys.sh list
 #   scripts/keys.sh set -id alice -concurrency 64
 #   scripts/keys.sh rotate -id alice -grace 24h
@@ -14,7 +15,7 @@
 #   scripts/keys.sh check TOKEN [MODEL]     # verify a client token end-to-end
 #
 # Client tokens are printed once on stdout (everything else on stderr), so
-# TOKEN=$(scripts/keys.sh add -id alice) captures only the secret.
+# TOKEN=$(scripts/keys.sh add -id alice ...) captures only the secret.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -124,7 +125,7 @@ check)
 	;;
 
 help | -h | --help)
-	sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
 	;;
 
 *)

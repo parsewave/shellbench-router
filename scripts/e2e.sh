@@ -22,10 +22,10 @@ go build -o "$WORK/loadgen" ./tools/loadgen
 
 echo "== token CLI"
 export TOKENS_FILE="$WORK/tokens.json"
-ALICE=$("$WORK/oaiproxy" token add -id alice -note "full access" 2>/dev/null)
-BOB=$("$WORK/oaiproxy" token add -id bob -models gpt-4o-mini -rpm 6000 -concurrency 64 -expires 90d 2>/dev/null)
-BENCH=$("$WORK/oaiproxy" token add -id bench 2>/dev/null)
-OLD=$("$WORK/oaiproxy" token add -id rotating 2>/dev/null)
+ALICE=$("$WORK/oaiproxy" token add -id alice -unsigned -note "full access" 2>/dev/null)
+BOB=$("$WORK/oaiproxy" token add -id bob -unsigned -models gpt-4o-mini -rpm 6000 -concurrency 64 -expires 90d 2>/dev/null)
+BENCH=$("$WORK/oaiproxy" token add -id bench -unsigned 2>/dev/null)
+OLD=$("$WORK/oaiproxy" token add -id rotating -unsigned 2>/dev/null)
 NEW=$("$WORK/oaiproxy" token rotate -id rotating -grace 1h 2>/dev/null)
 "$WORK/oaiproxy" token list
 grep -q "$ALICE" "$TOKENS_FILE" && { echo "FAIL: plaintext token in tokens file"; exit 1; }
