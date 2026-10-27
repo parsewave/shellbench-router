@@ -1,6 +1,6 @@
 # pxclient
 
-`pxadmin`, a command-line tool for managing gateway tokens from your own machine (see "Getting started" in the top-level README).
+`pxadmin`, a command-line tool for managing gateway tokens from your own machine (see the top-level README).
 
 ```bash
 pip install "pxclient @ git+https://github.com/parsewave/shellbench-router.git#subdirectory=clients/python"

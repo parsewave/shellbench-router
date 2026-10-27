@@ -235,5 +235,5 @@ fi
 cat >&2 <<EOF
 
 On this server, scripts/keys.sh does the same (add, list, rotate, revoke, ...).
-See README "Getting started".
+See README.md for the next steps.
 EOF

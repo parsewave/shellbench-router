@@ -1,467 +1,141 @@
-# shellbench-router: authenticated OpenAI-compatible API gateway
+# shellbench-router
 
-A small Go reverse proxy that lets a model provider share access to their API account **without sharing their API key**. The provider hosts the gateway with their real key (OpenAI, OpenRouter, PackyAPI, or any OpenAI-compatible API). Each user gets their own proxy token, which can be revoked, rotated, expired, limited, and locked to the user's IP addresses. Clients keep using the standard OpenAI SDKs and tools; only `base_url` and `api_key` change.
+Share one model-provider API key (OpenAI, OpenRouter, PackyAPI, or any OpenAI-compatible API) with many people and harnesses **without handing out the key**. You run this gateway on a server. Everyone else gets their own `sk-px-…` token and uses it like a normal OpenAI key. Each token can be revoked, rotated, expired, rate-limited, limited to certain models, and locked to certain IP addresses.
 
 ```
-client (OpenAI SDK)                 provider's server                                  upstream
- base_url=https://host/v1  ──TLS──▶ Caddy :443 ──HTTP──▶ proxy :8080 ──TLS──▶ api.openai.com/v1
- api_key=sk-px-… (proxy token)      (HTTPS, ACME)        │ 1 verify proxy token (SHA-256, constant time)   openrouter.ai/api/v1
-                                                         │ 2 route allow-list (else 404)                    any OpenAI-compatible API
-                                                         │ 3 per-token rate / concurrency limits (429)
-                                                         │ 4 per-token model allow-list from JSON body (403)
-                                                         │ 5 drop client credentials, inject provider key
-                                                         │ 6 stream the response back unmodified (SSE flushed per event)
-                                                         └ structured logs: metadata + token usage only
+your users / Harbor ──HTTPS──▶ gateway (your server) ──▶ provider API
+   sk-px-… token                 holds the real key
 ```
-
-* Go standard library only, with no third-party modules. About 2,750 lines for the proxy itself. The distroless image is about 25 MB.
-* `httputil.ReverseProxy` with a tuned transport: HTTP/2, connection pooling, no gzip re-encoding.
-* Request bodies are bounded and inspected only for the top-level `model`/`stream` fields. Everything else is forwarded byte-for-byte.
-* Responses are never buffered, and streaming stays streaming.
-
-Contents: **[Getting started](#getting-started)** · [Setup details](#1-setup-details) · [Providers](#2-providers) · [Managing keys](#3-managing-keys) · [Clients](#4-using-the-gateway-clients) · [Configuration](#5-configuration) · [Reliability](#6-reliability-behaviour) · [Logging](#7-logging-and-metrics) · [Security](#8-security-model) · [Results](#9-test-and-benchmark-results) · [Testing](#10-running-the-tests) · [Limitations](#11-limitations) · [Layout](#12-repository-layout)
 
 ---
 
-## Getting started
+## 1. Set up the gateway (once, about 5 minutes)
 
-Two people are involved:
-
-* **The admin** runs the gateway and holds the real provider API key.
-* **Users** get a proxy token (`sk-px-…`) and use it like a normal OpenAI key. They never see the real key.
-
-Each token can be **locked to the user's IP addresses**, so a token that leaks into a log, a repo or a chat message is useless from anywhere else.
-
-### Step 1 (admin): start the gateway
-
-You need a Linux server with Docker and ports 80 and 443 open to the internet. A domain name is optional.
+You need a Linux server with Docker, and ports 80 and 443 open to the internet. You don't need a domain name.
 
 ```bash
-git clone https://github.com/parsewave/shellbench-router.git && cd shellbench-router
+git clone https://github.com/parsewave/shellbench-router.git
+cd shellbench-router
 scripts/setup.sh
 ```
 
-The script asks for your provider (OpenAI, OpenRouter, PackyAPI, or any OpenAI-compatible URL), a hostname (press Enter for a free `https://<your-ip>.sslip.io` address with a real certificate), and your provider API key. When it finishes, it prints:
+It asks three questions:
 
-* the gateway URL, for example `https://203-0-113-7.sslip.io`
-* your **admin key** (`sk-pxadmin-…`), shown once. Put it in your password manager.
+1. **Provider:** `openai`, `openrouter`, `packy`, or `custom` (any OpenAI-compatible URL).
+2. **Hostname:** press Enter to get a free `https://<your-ip>.sslip.io` address with a real HTTPS certificate.
+3. **Your provider API key:** input is hidden. It's stored on the server only.
 
-### Step 2 (admin): install the admin tool on your own machine
+At the end it prints two things. Save both:
+
+```
+Done. Gateway: https://203-0-113-7.sslip.io/v1
+Admin key (shown once; put it in your password manager):
+  sk-pxadmin-...
+```
+
+## 2. Install the admin tool on your own computer
 
 ```bash
 pip install "pxclient @ git+https://github.com/parsewave/shellbench-router.git#subdirectory=clients/python"
-export PX_ADMIN_URL=https://203-0-113-7.sslip.io
-export PX_ADMIN_KEY=sk-pxadmin-...
-pxadmin list
+
+export PX_ADMIN_URL=https://203-0-113-7.sslip.io     # your gateway, without /v1
+export PX_ADMIN_KEY=sk-pxadmin-...                   # the admin key from step 1
+
+pxadmin list                                         # should print "no users yet"
 ```
 
-### Step 3 (admin): create a token for each user
+## 3. Give someone access
 
-Ask the user which IP address their requests will come from. They can find out with `curl -s https://api.ipify.org` on that machine. Then:
+Find out the IP address their requests will come from (they can run `curl -s https://api.ipify.org` on that machine). Then:
 
 ```bash
 pxadmin add alice --allow-ips 198.51.100.24 --models gpt-4o-mini --expires 90d
 ```
 
-This prints alice's token and a ready-to-send message with the base URL, token and models. Send it to her.
+It prints a message to send them, containing the base URL, their token and their models. That's it.
 
-* `--allow-ips` takes a comma-separated list of addresses and ranges, for example `198.51.100.24,10.0.0.0/8`. Leave it out to allow any IP, but then anyone holding a copy of the token can use it.
-* Leave out `--models` to allow every model. The default limit is 16 concurrent requests; change it with `--concurrency`.
+* `--allow-ips` locks the token to those addresses, so a leaked copy is useless anywhere else. It takes several values separated by commas, including ranges: `198.51.100.24,10.0.0.0/8`. If you leave it out, the token works from any IP.
+* If you leave out `--models`, every model is allowed. Each user gets 16 concurrent requests unless you set `--concurrency`.
 
-### Step 4 (user): use it
+## 4. Use it
 
-Any OpenAI SDK or tool works. Change only the base URL and key:
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="https://203-0-113-7.sslip.io/v1", api_key="sk-px-...")
-reply = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}])
-print(reply.choices[0].message.content)
-```
+Any OpenAI SDK, tool or harness works. Change only two settings:
 
 ```bash
-# Or, for tools and harnesses that read the standard environment variables (Harbor agents, Codex, LiteLLM, ...):
 export OPENAI_BASE_URL=https://203-0-113-7.sslip.io/v1
 export OPENAI_API_KEY=sk-px-...
 ```
 
-### Everyday admin commands
-
-```bash
-pxadmin list                                  # everyone: status, allowed IPs, models, limits, expiry
-pxadmin revoke alice                          # cut someone off now (pxadmin enable alice to undo)
-pxadmin rotate alice --grace 24h              # new token; the old one keeps working for 24h
-pxadmin set alice --allow-ips 198.51.100.24,203.0.113.0/24   # change IPs, --models, --rpm, --concurrency or --expires
-pxadmin remove alice                          # delete
+```python
+from openai import OpenAI
+client = OpenAI(base_url="https://203-0-113-7.sslip.io/v1", api_key="sk-px-...")
+print(client.responses.create(model="gpt-4o-mini", input="hi").output_text)
 ```
-
-On the server itself, `scripts/keys.sh` does the same things (`scripts/keys.sh list`, `scripts/keys.sh add -id alice -allow-ips 198.51.100.24 ...`, and so on), and `docker compose logs -f proxy` shows every request with its client IP and token usage.
-
-### If something fails
-
-| Error | Meaning |
-|---|---|
-| `401 invalid_api_key` | The token is wrong, expired or revoked. |
-| `403 ip_not_allowed` | The token is locked to other IPs. The message shows the address the gateway saw; ask the admin to add it. |
-| `403 model_not_allowed` | Ask the admin for access to that model. |
-| `429` | You hit your rate or concurrency limit. The SDK retries automatically. |
-
-All error codes: [Clients](#4-using-the-gateway-clients). Everything below is reference.
 
 ---
 
-## 1. Setup details
+## Running Harbor through the gateway
 
-Prerequisites: a Linux host with Docker and Docker Compose v2, and ports 80/443 reachable from the internet (for Let's Encrypt). A DNS name is optional, since `--domain auto` uses `<public-ip>.sslip.io`.
+Tested with Harbor 0.9 and the `codex` agent.
 
-```bash
-git clone https://github.com/parsewave/shellbench-router.git && cd shellbench-router
-
-# Interactive: asks for provider, hostname and the upstream key (input hidden)
-scripts/setup.sh
-
-# Or fully specified, e.g. OpenRouter with a first client:
-scripts/setup.sh --provider openrouter --domain auto \
-  --referer https://github.com/your-org/your-app --title "My Benchmark" \
-  --client alice --client-allow-ips 198.51.100.24 --client-models 'openai/*,anthropic/*' --client-concurrency 64
-```
-
-`setup.sh` does the following:
-1. Stores the upstream key in `secrets/upstream_api_key`, never in `.env`. The file is owner-only, owned by the container's uid 65532 (mode 0400).
-2. Writes `.env` with the provider's base URL and `COMPOSE_FILE`, so plain `docker compose …` picks up the key-file override.
-3. Creates the admin API key in `secrets/admin_api_key` (same protection) and enables `/admin/`. Skip this with `--no-admin`.
-4. Runs `docker compose up -d --build` and waits for the proxy to report healthy.
-5. Optionally creates the first client token and prints it **once**.
-6. Checks `https://<host>/healthz` end to end, and `GET /v1/models` too when the first client has no IP allowlist.
-7. Prints the gateway URL and the admin key, **once**.
-
-Non-interactive (CI or automation): `UPSTREAM_KEY=… scripts/setup.sh --provider openai --domain llm.example.com --yes`.
-
-Options: `--provider openai|openrouter|packy|custom`, `--base-url URL` (custom), `--domain NAME|auto`, `--host-network`, `--referer`/`--title` (OpenRouter attribution), `--no-admin`, `--client ID`, `--client-allow-ips LIST`, `--client-models LIST`, `--client-concurrency N`, `--force`, `--yes`.
-
-**Host networking.** `--host-network` adds `deploy/docker-compose.host.yml`. Caddy and the proxy then use the host network, with the proxy bound to `127.0.0.1:8080`. Use it on hosts where Docker can't create more networks ("all predefined address pools have been fully subnetted"), or to skip the docker-proxy hop under heavy load.
-
-**Manual setup**, without the script: copy `.env.example` to `.env` (chmod 600), put the key in `secrets/upstream_api_key` (see `deploy/docker-compose.keyfile.yml`), then run `docker compose up -d --build`.
-
-## 2. Providers
-
-Any OpenAI-compatible upstream works; set `UPSTREAM_BASE_URL` (or use `--provider`).
-
-| Provider | `UPSTREAM_BASE_URL` | Notes |
-|---|---|---|
-| OpenAI | `https://api.openai.com/v1` | Optional `UPSTREAM_ORGANIZATION`, `UPSTREAM_PROJECT`. |
-| OpenRouter | `https://openrouter.ai/api/v1` | See below. |
-| PackyAPI | `https://www.packyapi.com/v1` | See below. |
-| Other | `https://<host>/v1` | Must be https. Use `ALLOW_INSECURE_UPSTREAM=true` only for local mocks. |
-
-**OpenRouter.**
-* Model ids contain a slash (`openai/gpt-4.1-nano`, `anthropic/claude-…`). Allow-lists work with prefixes: `-models 'openai/*,mistralai/mistral-nemo'`.
-* `GET /v1/models/{id}` can't be routed for slash ids. Use `GET /v1/models`, which is filtered per token.
-* App attribution: `UPSTREAM_HEADERS=HTTP-Referer=https://your.site;X-Title=Your App` (or `--referer`/`--title`). Client-sent attribution headers are dropped by the header allow-list, so set them on the provider side.
-* Chat Completions, Responses, embeddings and model listing all work through the gateway. See [Results](#9-test-and-benchmark-results).
-* Check spend with `GET https://openrouter.ai/api/v1/key` using the upstream key.
-
-**PackyAPI** (new-api based relay). Behaviour observed in October 2026 that clients need to know about:
-* **Available models depend on the key's group.** Check with `GET /v1/models` through the gateway. On the `codex-sale` group, GPT models accept **only the Responses API**; `/v1/chat/completions` returns `protocol_not_supported`. Gemini models accept chat completions.
-* **Send list-form `input`** (`[{"role":"user","content":"…"}]`). About 10% of requests with string `input` land on a channel that answers `400 Input must be a list`.
-* **Non-streaming Responses return an empty `output`**, though usage is still billed, and the final `response.completed` event is empty too. Read the text from the `response.output_text.delta` events (the Codex CLI does this).
-* The codex channel adds about 4.4k cached instruction tokens to every request.
-* **Channels can disappear temporarily** (`model_not_found: 当前令牌未覆盖供应商`) and come back on their own.
-* Check spend with `GET https://www.packyapi.com/v1/dashboard/billing/usage` using the upstream key. `total_usage` is in cents.
-
-## 3. Managing keys
-
-There are two kinds of keys: **client tokens**, which you hand out, and the **upstream key**, which is the provider's own and never leaves the server.
-
-### Client tokens: `scripts/keys.sh`
+**1. Create a token for the machine that runs Harbor.**
 
 ```bash
-scripts/keys.sh add -id alice -allow-ips 198.51.100.24 -models gpt-4o-mini,o3* -rpm 600 -concurrency 32 -expires 90d   # prints token once
-scripts/keys.sh add -id bob -concurrency 64                       # any IP, all models
-scripts/keys.sh list                                              # status, limits, expiry, hints; never full tokens
-scripts/keys.sh set    -id alice -models 'openai/*' -rpm 1200 -expires never
-scripts/keys.sh rotate -id alice -grace 24h                       # new token; old one valid 24h more (default 0 = revoked now)
-scripts/keys.sh revoke -id alice                                  # immediate; undo with: enable -id alice
-scripts/keys.sh remove -id alice                                  # delete entirely
-scripts/keys.sh check  sk-px-… [model]                            # verify a token end-to-end through HTTPS
-
-TOKEN=$(scripts/keys.sh add -id carol)    # only the token goes to stdout
+pxadmin add harbor --allow-ips <harbor-machine-ip> --models gpt-6.1-terra --concurrency 32 --expires 30d
 ```
 
-* `keys.sh` wraps `docker compose run --rm --no-deps proxy token …`. Without Docker, the same commands are `oaiproxy token …`, run against `TOKENS_FILE`.
-* **Format and storage.** Tokens are `sk-px-` plus 256 random bits. Only `sha256(token)` and a 4-character hint are stored, in `/config/tokens.json` on the `proxy_config` volume. The file is written atomically with mode 0600. See `deploy/tokens.example.json` for the format.
-* **Changes apply within about 2 seconds** without a restart. `kill -HUP` forces an immediate reload. An invalid file is rejected and the previous one stays active. A missing file fails closed: every request gets 401.
-* **Model patterns** are exact and case-sensitive. A trailing `*` matches by prefix. An empty list or `*` allows every model. Restricted tokens see only their allowed models in `GET /v1/models`.
-* **IP allowlists.** `-allow-ips 198.51.100.24,10.0.0.0/8` (IPv4 or IPv6 addresses and CIDR ranges); `-allow-ips '*'` clears it. Requests from other addresses get `403 ip_not_allowed`. The client IP is the address Caddy saw, taken from the last `X-Forwarded-For` entry and only when the connection comes from a trusted proxy (`TRUSTED_PROXIES`, default loopback and private ranges), so clients can't fake it. Unknown tokens still get 401, so the allowlist reveals nothing to them.
-* **Limits.** `rpm` is a token bucket (`burst` defaults to `rpm`), and `concurrency` caps in-flight requests per token. When a limit is hit, the proxy returns 429 with `Retry-After` immediately rather than queuing; SDK retries handle it. New tokens are unlimited by default, so **give every client a `-concurrency` limit** so one client can't use all of `MAX_INFLIGHT`.
-* Revoking a token doesn't cut streams already in flight; they end normally or at `UPSTREAM_TIMEOUT`.
+If Harbor runs **on the gateway server itself**, the trial containers reach the gateway from Docker addresses, so allow those too: `--allow-ips <server-ip>,172.16.0.0/12`.
 
-### Admin API (HTTP)
-
-The same operations are available over HTTPS, so tokens can be managed without SSH. `pxadmin` (Getting started, step 2) wraps it; the raw endpoints are below. `setup.sh` enables it. On older deployments, or to rotate the key:
+**2. Run the trial with these variables:**
 
 ```bash
-scripts/keys.sh admin-key      # prints the admin key once; rerun to rotate it (no restart)
+export OPENAI_BASE_URL=https://203-0-113-7.sslip.io/v1
+export OPENAI_API_KEY=sk-px-...          # the harbor token
+export HARBOR_ALLOW_INTERNET=1           # let the agent reach the gateway directly
+
+harbor trial start -p path/to/task -a codex -m openai/gpt-6.1-terra
 ```
 
-This writes `secrets/admin_api_key` (owner-only, like the upstream key), adds `deploy/docker-compose.admin.yml` to `COMPOSE_FILE`, and recreates the proxy. Without an admin key, `/admin/` answers 404.
+**On Parsewave servers** (the Harbor build with the Parsewave proxy), Codex uses your Parsewave login instead of the gateway token if it finds one. Run Harbor with an empty home directory and no Parsewave token so it uses the gateway:
 
 ```bash
-A="Authorization: Bearer $ADMIN_KEY"; B=https://llm.example.com
-
-curl -H "$A" $B/admin/clients                                                     # list (never shows tokens)
-curl -H "$A" $B/admin/clients -d '{"id":"alice","allowed_ips":["198.51.100.24"],"models":["gpt-4o-mini","o3*"],"rpm":600,"max_concurrent":32,"expires":"90d"}'
-                                                                                  # -> 201 {"client":{...},"token":"sk-px-..."} (token shown once)
-curl -H "$A" $B/admin/clients/alice
-curl -H "$A" -X PATCH $B/admin/clients/alice -d '{"rpm":1200,"models":["*"]}'      # only the given fields change
-curl -H "$A" -X POST  $B/admin/clients/alice/rotate -d '{"grace":"24h"}'          # -> new token; old one valid 24h
-curl -H "$A" -X POST  $B/admin/clients/alice/revoke                               # or /enable
-curl -H "$A" -X DELETE $B/admin/clients/alice
+env -u PARSEWAVE_TOKEN -u CODEX_PARSEWAVE_TOKEN -u CODEX_HTTPS_PROXY -u CODEX_AUTH_B64 \
+  HOME=$(mktemp -d) PATH=$HOME/.local/bin:$PATH \
+  harbor trial start -p path/to/task -a codex -m openai/gpt-6.1-terra
 ```
 
-* Fields: `models` (`[]` or `["*"]` = all), `allowed_ips` (`[]` or `["*"]` = any IP), `rpm`, `burst`, `max_concurrent`, `expires` (`90d`, `12h`, `2027-01-31`, RFC3339, `never`), `note`. Unknown fields are rejected.
-* Changes apply immediately. The API and the CLI edit `tokens.json` under a shared file lock, so concurrent changes from either are never lost.
-* Every change is logged (`"msg":"admin change"`, action, client, remote address); tokens and the admin key never are.
-* The admin key is all-powerful: keep it in a password manager, not in scripts or chat. Rotate it with `scripts/keys.sh admin-key`.
+To check it's working: `docker compose logs -f proxy` on the gateway shows each request as `"client":"harbor"` with `"status":200`.
 
-### Upstream key: `scripts/keys.sh upstream-key`
+**Which agent to use:** some providers serve a model only over the Responses API. PackyAPI does this for `gpt-6.1-terra`, and answers chat completions with `protocol_not_supported`. For those models, use an agent that speaks the Responses API, such as `codex`. Agents that use chat completions (LiteLLM-based ones such as `terminus-2`) need a model the provider serves over chat completions.
+
+---
+
+## Everyday commands
 
 ```bash
-scripts/keys.sh upstream-key              # prompts (hidden); or: printf %s "$NEW_KEY" | scripts/keys.sh upstream-key
+pxadmin list                                   # everyone: status, allowed IPs, models, limits, expiry
+pxadmin revoke alice                           # cut off now      (pxadmin enable alice to undo)
+pxadmin rotate alice --grace 24h               # new token; old one keeps working for 24h
+pxadmin set alice --allow-ips 198.51.100.24,203.0.113.0/24 --models '*'
+pxadmin remove alice
 ```
 
-The command overwrites `secrets/upstream_api_key` **in place**, waits for the proxy's `upstream key reloaded` log line, and prints the new non-reversible fingerprint. If no hot reload happens, it restarts the proxy. Then revoke the old key at the provider.
+On the server you can do the same with `scripts/keys.sh` (`scripts/keys.sh list`, `scripts/keys.sh add -id alice -allow-ips 198.51.100.24`, …). `docker compose logs -f proxy` shows every request with its user, IP, status and token usage.
 
-Why in place: Docker bind-mounts a single file by inode. Editors and `mv` replace the inode, which the running container never sees (we tested this), so the rotation would silently not happen until a restart. If you rotate by hand, use `sudo tee secrets/upstream_api_key` or restart the proxy afterwards. The startup log line `upstream_key_fingerprint` always shows which key is active.
+**Updating the gateway:** `git pull && docker compose up -d --build` on the server.
 
-## 4. Using the gateway (clients)
+## If something fails
 
-```python
-from openai import OpenAI
-client = OpenAI(base_url="https://llm.example.com/v1", api_key="sk-px-…your proxy token…")
+| You see | Fix |
+|---|---|
+| `401 invalid_api_key` | Wrong, expired or revoked token. Check with `pxadmin list`. |
+| `403 ip_not_allowed` | The message says which IP the gateway saw. Add it: `pxadmin set NAME --allow-ips <old>,<new>`. |
+| `403 model_not_allowed` | `pxadmin set NAME --models <list>`, or `'*'` for all models. |
+| `429` | The user hit their rate or concurrency limit. The SDK retries; raise it with `--concurrency` / `--rpm`. |
+| `protocol_not_supported` | The provider doesn't serve that model over this API. Use the Responses API, or an agent like `codex`. |
+| Harbor: "Reconnecting… error sending request" or "access token could not be refreshed" | Use the Harbor variables above (`HARBOR_ALLOW_INTERNET=1`, empty `HOME`, no Parsewave token). |
+| `setup.sh`: HTTPS not reachable | Open ports 80 and 443. Check `docker compose logs caddy`. |
 
-client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}])
-for ev in client.chat.completions.create(model="gpt-4o-mini", messages=[...], stream=True): ...
-client.responses.create(model="o3", input=[{"role": "user", "content": "…"}], reasoning={"effort": "high"})
-client.embeddings.create(model="text-embedding-3-small", input=["a", "b"])
-```
+---
 
-```bash
-export OPENAI_BASE_URL=https://llm.example.com/v1 OPENAI_API_KEY=sk-px-…   # honored by most tools and SDKs
-```
-
-Errors use OpenAI's error format, so SDK exception types work as usual:
-
-| Status | `code` | Meaning |
-|---|---|---|
-| 401 | `invalid_api_key` | Proxy token missing, unknown, revoked, or expired |
-| 403 | `model_not_allowed` | Token is not permitted to use that model, or a restricted token sent a non-JSON body |
-| 400 | `model_required` / `invalid_json` / `invalid_content_type` | Restricted token sent no `model`, or the body or headers are malformed or ambiguous |
-| 404 | `unknown_url` / `model_not_found` | Endpoint not enabled on this gateway / model hidden from this token |
-| 413 | `request_too_large` | Body exceeds `MAX_REQUEST_BYTES` |
-| 429 | `rate_limit_exceeded` / `concurrency_limit_exceeded` | Per-token limit (with `Retry-After`) |
-| 429 | (upstream's code) | Upstream rate limit, after the gateway's own safe retries |
-| 502 | `upstream_auth_error` | The provider's upstream key was rejected. Contact the operator. |
-| 502 / 504 | `upstream_unavailable` / `upstream_timeout` | Upstream unreachable / too slow |
-| 503 | `proxy_overloaded` | `MAX_INFLIGHT` or `MAX_BUFFERED_BYTES` reached |
-
-Each response carries `X-Proxy-Request-Id`, which matches the gateway logs, plus the upstream's own request id when it sends one.
-
-## 5. Configuration
-
-All configuration is through environment variables (`.env`). See `.env.example`.
-
-| Variable | Default | Notes |
-|---|---|---|
-| `UPSTREAM_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible base URL; must be https |
-| `UPSTREAM_API_KEY_FILE` / `UPSTREAM_API_KEY` | — | Exactly one is required. Prefer the file; it is hot-reloaded when overwritten in place. |
-| `UPSTREAM_HEADERS` | — | Extra upstream headers, `Name=value;Name2=value2`. Credential headers are rejected. |
-| `UPSTREAM_ORGANIZATION`, `UPSTREAM_PROJECT` | — | OpenAI only. Client-supplied values are always dropped. |
-| `PROXY_DOMAIN` | — | Hostname Caddy serves and gets a certificate for |
-| `COMPOSE_FILE` | — | Compose overrides to apply (set by `setup.sh`) |
-| `TOKENS_FILE` | `/config/tokens.json` in Docker | |
-| `ALLOWED_ROUTES` | see below | Comma-separated `METHOD /v1/path`; `*` matches one path segment. Replaces the defaults. |
-| `LISTEN_ADDR` | `:8080` (`127.0.0.1:8080` with host networking) | |
-| `METRICS_ADDR` | off | Prometheus `/metrics` on a separate listener. Unauthenticated, so keep it on loopback or a trusted network. |
-| `MAX_REQUEST_BYTES` | 32 MiB | Per request body. Caddy also caps at 64 MB. |
-| `MAX_BUFFERED_BYTES` | 1 GiB | Global cap on request bodies held in memory (503 beyond) |
-| `MAX_INFLIGHT` | 2048 | Global concurrency cap (503 beyond) |
-| `MAX_RETRIES` | 2 | 0–3. See §6. |
-| `MAX_RETRY_WAIT` | 20s | A longer upstream `Retry-After` is passed to the client instead |
-| `UPSTREAM_TIMEOUT` | 30m | Total per request (long reasoning) |
-| `STREAM_IDLE_TIMEOUT` | 10m | Max silence between upstream bytes. Also frees clients that stop reading. |
-| `BODY_READ_TIMEOUT` | 60s | Slow-upload guard |
-| `LOG_FORMAT` / `LOG_LEVEL` | `json` / `info` | stdout |
-| `ACCESS_LOG_FILE` | — | Optional JSONL access log. Put it on its own rotated volume. |
-| `SHUTDOWN_TIMEOUT` | 30s | Grace period for in-flight requests on SIGTERM |
-| `ADMIN_API_KEY_FILE` / `ADMIN_API_KEY` | — | Enables the admin API at `/admin/` (set up by `scripts/keys.sh admin-key`). File form is hot-reloaded. |
-| `TRUSTED_PROXIES` | loopback + private ranges | Peers whose `X-Forwarded-For` is used as the client IP for allowlists (Caddy). Never expose the proxy port itself. |
-
-Default routes: `GET /v1/models`, `GET /v1/models/*`, `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/responses/input_tokens`, `GET|DELETE /v1/responses/*`, `POST /v1/responses/*/cancel`, `GET /v1/responses/*/input_items`, `POST /v1/embeddings`. Any other path returns 404 without contacting the upstream. Clients always call `/v1/...`; the gateway maps that onto the upstream base path (e.g. OpenRouter's `/api/v1`).
-
-## 6. Reliability behaviour
-
-**Retries never duplicate potentially billable work:**
-
-| Condition | Retried? | Why |
-|---|---|---|
-| Dial / DNS failure | yes, any method | The request never left the gateway |
-| HTTP 429 (not `insufficient_quota`) | yes, any method | The upstream rejected it without processing it |
-| 5xx or dropped connection on GET/DELETE | yes | Idempotent |
-| 5xx, timeout, or dropped connection on **POST** | **no** | It may already have been processed and billed |
-| After any response byte reached the client | **never** | Retries happen before the response is handed to the client |
-
-* Backoff is exponential with jitter (500 ms base, 8 s cap). The gateway honors `Retry-After` and `retry-after-ms` up to `MAX_RETRY_WAIT`.
-* `Idempotency-Key` isn't forwarded, so Go's transport never replays a POST on its own.
-* OpenAI SDKs also retry 429/5xx themselves (`max_retries=2`). Set `MAX_RETRIES=0` if you want only client-side retries.
-* **Streaming:** SSE is flushed to the client on every upstream write. If the upstream dies mid-stream, the client connection is aborted rather than cleanly closed, so the SDK raises an error instead of returning a silently truncated answer.
-* **Cancellation:** a client disconnect cancels the upstream request at once, both mid-stream and while waiting for headers. The provider doesn't pay for abandoned generations.
-* **Upstream errors:** an upstream 401 becomes a generic 502 `upstream_auth_error`; the upstream message, which may quote part of the key, is never relayed. Upstream 403s become a generic 403. Other upstream errors are passed through, so SDK users see real validation messages, but anything that looks like a key or an `org-`/`proj_`/`user-` id is masked first. A JSON error mislabelled as `text/event-stream` is relabelled `application/json`.
-
-## 7. Logging and metrics
-
-One structured record per request goes to stdout, and optionally to a JSONL file:
-
-```json
-{"time":"…","level":"INFO","msg":"request","request_id":"px_162a…","client":"alice","method":"POST",
- "endpoint":"POST /v1/responses","path":"/v1/responses","model":"gpt-6.1-terra","stream":true,"status":200,
- "upstream_status":200,"latency_ms":2412.4,"ttfb_ms":2063.2,"retries":0,"input_tokens":4388,"output_tokens":5,
- "reasoning_tokens":0,"cached_tokens":4224,"total_tokens":4393}
-```
-
-* **Token usage** comes from the response's final `usage` object. That works for regular JSON, the Chat Completions stream's last chunk (clients must send `stream_options.include_usage`; the gateway never edits requests to add it), and the Responses API's `response.completed` event. It's parsed from the last 16 KiB only, so responses are never buffered.
-* **Never logged:** prompts, completions, headers, and tokens.
-* `error` holds a reason code: `invalid_token`, `revoked_token`, `model_not_allowed`, `client_disconnected`, `upstream_idle_timeout`, `upstream_stream_interrupted`, …
-* Unauthenticated requests are logged at most 20 per second.
-* `/healthz` is public.
-* **Metrics:** `/metrics` lives on `METRICS_ADDR`, which Caddy doesn't expose. It reports `oaiproxy_requests_total{client,endpoint,code}`, `oaiproxy_errors_total{reason}`, `oaiproxy_tokens_total{client,model,kind}`, latency and TTFB histograms, retries, in-flight requests, goroutines, and heap.
-
-## 8. Security model
-
-* **The upstream key stays on the server.** It lives only in the proxy container, as a mounted file or env var. It isn't in the image (`.dockerignore` excludes `.env`, `secrets/`, `config/`), isn't in Caddy, and isn't in logs, which show only a 4-byte SHA-256 fingerprint. It never appears in responses: `OpenAI-Organization`, `OpenAI-Project`, `Set-Cookie` and `x-ratelimit-*` headers are stripped (the last reveal the provider's tier and the combined usage of all clients), and error bodies and `/v1/models` are scrubbed.
-* **Client credentials never go upstream.** Request headers are forwarded by allow-list only: `Content-Type`, `Accept`, `User-Agent`, `OpenAI-Beta`, `X-Client-Request-Id`, `X-Stainless-*`. `Authorization`, cookies, `X-Forwarded-*`, client org/project headers and request trailers are dropped, so client IPs are not sent upstream. Query strings are forwarded only on GET/DELETE.
-* **Authentication** hashes the presented token and compares it against every stored hash with `crypto/subtle`, with no early exit. Every failure kind returns the same 401. There's no admin API; management happens through the CLI on the host.
-* **Model enforcement** uses an exact-key JSON scanner instead of `encoding/json` struct decoding, which matches keys case-insensitively. That closes parser-differential bypasses such as `{"model":"o3","MODEL":"gpt-4o"}`. Duplicate `model` keys, escaped keys, invalid JSON, and multiple or malformed `Content-Type` headers are all handled. Restricted tokens may only send JSON, and upstream always receives exactly `Content-Type: application/json` for them. The scanner is fuzz-tested against a reference decoder.
-* **Not an open proxy.** The upstream host is fixed by configuration. Only allow-listed method+path pairs are forwarded. Percent-encoded slashes, empty segments and dot segments are rejected, not normalized.
-* **Resource limits.** Bodies are bounded per request and globally, with the budget reserved before reading, so stalled uploads cannot exhaust memory. A client that stops reading a stream is disconnected at `STREAM_IDLE_TIMEOUT`, which frees its slot.
-* **Container hardening:** distroless static image, uid 65532, read-only rootfs, `cap_drop: ALL`, `no-new-privileges`. Only Caddy publishes ports.
-
-## 9. Test and benchmark results
-
-### Automated tests
-* **Go suite:** 38 tests plus an 11-case retry table. Passes with `go test -race`, repeated runs.
-  * **Core properties:** valid and invalid tokens; per-client model access, including parser-differential and Content-Type bypass attempts; that provider keys never reach clients and client credentials never reach the upstream; byte-for-byte passthrough; incremental SSE; 300 concurrent requests; per-token and global limits.
-  * **Failure handling:** cancellation propagated mid-stream and before headers; upstream and idle timeouts; a stalled reader being released; the retry policy; dropped connections and interrupted streams not replayed; and logs, access log and metrics free of secrets.
-* **Fuzzing:** about 3.5M executions of the model-field scanner against a reference decoder, with no disagreement.
-* **OpenAI Python SDK compatibility through the gateway:**
-  * against a mock upstream: 11/11 (openai-python 2.48);
-  * **against real OpenRouter: 11/11** (chat non-stream/stream/tools, Responses non-stream/stream, embeddings, model list, filtered model list, 401, 403, 20 concurrent async streams);
-  * **against real PackyAPI: 9/9** (openai-python 3.39; embeddings and non-streaming Responses skipped because of the PackyAPI limitations in §2).
-* **Independent security review:** found no credential exposure, auth bypass or open-proxy path. Its availability and hardening findings were fixed, each with a regression test: memory reservation for declared body sizes, stalled readers pinning slots, Content-Type tricks, trailer forwarding, rate-limit header exposure, and log flooding.
-
-### Gateway capacity (mock LLM upstream)
-
-This isolates the gateway's own cost. The setup:
-* **Gateway:** Caddy and the proxy on a 16-vCPU / 30 GB Linux VM that was also running other workloads. HTTPS with a Let's Encrypt certificate, HTTP/2 from clients.
-* **Load:** generated from a separate 16-vCPU host, 24 ms away, by 4–12 resource-capped load-generator containers (1–2 CPU each).
-* **Mock upstream:** on the gateway VM itself, using up to 5 cores at peak. It waits 300 ms, then streams 31 events 20 ms apart, so the best possible latency is about 945 ms. "Steady" percentiles leave out the first 3 s, when hundreds of TLS connections open at once.
-
-| Concurrent clients | Mode | Requests | Errors | Req/s | p50 | p95 | p99 | Proxy CPU / RSS |
-|---|---|---|---|---|---|---|---|---|
-| 100 | streaming | 4,700 | 0 | 103 | 948 ms | 953 | 954 | 0.4 core / 27 MB |
-| 300 | streaming | 13,972 | 0 | 307 | 947 | 952 | 954 | 0.9 / 68 MB |
-| 500 | streaming | 23,459 | 0 | 515 | 945 | 951 | 954 | 1.4 / 98 MB |
-| 1,000 | streaming | 46,910 | 0 | 1,010 | 945 | 955 | 960 | 2.3 / 169 MB |
-| 2,000 | streaming | 90,118 | 0 | 1,934 | 971 | 1,019 | 1,044 | 3.7 / 371 MB |
-| 3,000 | streaming | 74,867 | 0 | 2,321 | 1,146 | 1,323 | 1,478 | 4.2 / 549 MB |
-| 4,000 | streaming | 90,584 | 0 | 2,764 | 1,243 | 1,498 | 1,673 | 4.8 / 719 MB |
-| 3,000 | non-streaming | 248,761 | 0 | **7,565** | 335 | 404 | 468 | 3.5 / 221 MB |
-
-* **No request failed at any level.** Up to 1,000 concurrent streams the gateway adds about 15 ms at p99.
-* **Above about 2,000 the shared VM ran out of CPU** (load average 16–22 on 16 cores, with the mock using about a third). Latency then rises gradually instead of requests failing.
-* **In-process:** the full proxy path adds about 11 µs per request over a direct call, and the model scanner runs at about 1.5 GB/s.
-
-### Real upstreams
-
-| Upstream (model, API) | Concurrent clients | Requests | Errors | Req/s | p50 | p95 | p99 |
-|---|---|---|---|---|---|---|---|
-| PackyAPI (`gpt-6.1-terra`, Responses, streaming) | 100 | 1,101 | 0.18% | 35.9 | 2.2 s | 4.3 s | 7.3 s |
-| | 200 | 1,981 | 0 | 64.9 | 2.3 s | 4.2 s | 9.6 s |
-| | 300 | 3,078 | 0.16% | 99.5 | 2.4 s | 4.5 s | 6.8 s |
-| OpenRouter (`mistralai/mistral-nemo`, chat, streaming) | 50 | 618 | 0 | 30.9 | 1.4 s | 2.4 s | 3.8 s |
-| | 100 | 1,106 | 0 | 55.3 | 1.5 s | 3.2 s | 4.6 s |
-
-* **Latency is the upstream's.** At 300 concurrent real streams the proxy used under half a core and about 40 MB.
-* **The few PackyAPI errors** were streams that the relay ended without its `response.completed` event. The gateway saw a clean upstream close and logged no upstream error.
-* **Cost:** about $1.47 on PackyAPI and $0.0007 on OpenRouter for all real-upstream testing.
-
-### Token throughput (TPS)
-
-Setup: PackyAPI `gpt-6.1-terra`, streaming Responses API, `reasoning.effort: low`, a prompt that asks for a ~250-word story (about 312 visible output tokens per request), 30 s per level (60 s at c=1).
-* **Aggregate output** is all output tokens the upstream reported, reasoning included (1–5% here), divided by wall time.
-* **Per-stream decode** is visible output tokens divided by the time from the first text token to the end of the stream.
-* **TTFT** is time to the first text token.
-* **Proxy CPU** is the share of one core.
-
-| Concurrent streams | Requests | Errors | Aggregate output tok/s | Per-stream decode tok/s, p50 (p10–p90) | TTFT p50 / p95 | Latency p50 / p95 | Proxy CPU |
-|---|---|---|---|---|---|---|---|
-| 1 | 5 | 0 | 31 | 41 (35–42) | 2.7 s / 3.3 s | 10.8 s / 12.1 s | 1% |
-| 10 | 22 | 0 | 240 | 42 (37–45) | 2.6 s / 4.5 s | 9.9 s / 11.2 s | 13% |
-| 50 | 107 | 0 | 1,152 | 41 (38–45) | 2.7 s / 8.9 s | 9.9 s / 11.6 s | 27% |
-| 100 | 207 | 0 | 2,167 | 39 (36–43) | 2.5 s / 3.9 s | 10.1 s / 11.8 s | 50% |
-| 200 | 403 | 0 | 4,199 | 39 (35–42) | 2.6 s / 5.1 s | 10.4 s / 12.6 s | 66% |
-| 300 | 622 | 0.16% | **6,460** | 40 (36–44) | 2.6 s / 7.6 s | 10.3 s / 12.9 s | 93% |
-
-* **Per-stream speed stays at about 40 tok/s at every level, and aggregate TPS scales linearly** with the number of streams. The gateway adds no throughput ceiling in this range; the limit is the upstream model's decode speed, multiplied by how many streams the provider allows.
-* **Cost:** 200,575 output tokens at c=300. The whole TPS ramp cost about $1.22.
-* **To reproduce:** `tools/loadgen -api responses -stream -model gpt-6.1-terra -reasoning-effort low -prompt '…' -csv out.csv`. The CSV has `ttft_ms`, `out_tokens` and `reasoning_tokens` per request.
-
-## 10. Running the tests
-
-```bash
-go test -race ./...                                    # unit + integration tests (mocked upstream)
-go test -run '^$' -fuzz FuzzInspectJSON -fuzztime 30s ./internal/proxy/
-go test -run '^$' -bench . ./internal/proxy/           # in-process overhead benchmarks
-PYTHON=/path/to/python-with-openai scripts/e2e.sh      # local smoke test, SDK test, load benchmarks
-```
-
-To check a deployment with the OpenAI SDK:
-```bash
-PROXY_BASE_URL=https://host/v1 PROXY_TOKEN=sk-px-… PROXY_TOKEN_RESTRICTED=sk-px-… \
-PROXY_MODEL=openai/gpt-4.1-nano PROXY_EMBED_MODEL=openai/text-embedding-3-small \
-python tests/sdk/test_openai_sdk.py
-```
-Knobs: `PROXY_RESPONSES_MODEL`, `PROXY_RESTRICTED_MODELS`, `PROXY_EMBED_MODEL=` (skip embeddings), `PROXY_SKIP_RESPONSES_NONSTREAM=1` (relays with empty `output`), `PROXY_CONCURRENT_STREAMS`.
-
-Load testing: `tools/loadgen` drives concurrent requests (`-c`, `-d`, `-stream`, `-api chat|responses`, `-model`, `-max-tokens`, `-reasoning-effort`, `-error-backoff`, `-csv`, `-json`). For streams it records latency, TTFB, time to first text token, and output and reasoning tokens from the final usage event, so TPS can be computed from the CSV. `tools/mockupstream` is the fake LLM; with host networking, `docker compose --profile mock up -d` starts it next to the gateway (`UPSTREAM_BASE_URL=http://127.0.0.1:19999/v1`, `ALLOW_INSECURE_UPSTREAM=true`). Against real upstreams, always set `-error-backoff`: workers that hit errors otherwise retry in a tight loop and can trigger provider rate limits.
-
-## 11. Limitations
-
-* **Stored-object access is account-wide.** All clients share one upstream account, so a client that knows another client's Responses ID (`resp_…`) could fetch, delete or continue it. The IDs are unguessable. If tenants must be fully isolated, remove the `/v1/responses/*` routes and tell clients to send `store: false`, or use one upstream account per tenant.
-* **Model allow-lists check only the top-level `model` field.** They aren't a full spend policy: stored prompts (`prompt.id`), hosted tools (`image_generation` with its own model, `web_search`, `code_interpreter`, `file_search`) and pricing switches like `service_tier: "priority"` pass through unchecked.
-* **Rate limits count requests, not tokens.** Limiter state is in memory and per instance, so several replicas multiply the effective limits.
-* **Multipart endpoints** (audio, image edits, uploads) aren't in the default routes. If you enable them, only unrestricted tokens can use them.
-* **Chat Completions stream usage is logged only if the client sends `stream_options: {"include_usage": true}`.**
-* **WebSocket/Realtime endpoints aren't supported.**
-* **Revocation edge case:** an invalid hand-edit of `tokens.json` keeps the *previous* file active, including tokens you meant to revoke. Use `scripts/keys.sh`.
-
-## 12. Repository layout
-
-```
-cmd/oaiproxy/            binary: serve, token CLI, healthcheck
-internal/proxy/          handler, routing, JSON model scanner, retries, limits, usage tap, metrics (+ tests)
-internal/tokens/         token file format, hashing, rotation, IP allowlists, locked updates (+ tests)
-internal/admin/          admin HTTP API under /admin/ (+ tests)
-clients/python/          pxclient: the `pxadmin` CLI for the admin API (+ tests)
-internal/config/         environment configuration, upstream key file reloading (+ tests)
-internal/mockupstream/   fake OpenAI API used by tests, the mock tool and benchmarks
-tools/mockupstream/      standalone mock upstream (also shipped in the image, for load tests)
-tools/loadgen/           load generator (chat/responses, streaming, CSV/JSON output)
-tests/sdk/               OpenAI Python SDK compatibility test
-scripts/setup.sh         one-time provider setup
-scripts/keys.sh          client-token and upstream-key management
-scripts/e2e.sh           local end-to-end smoke test + benchmarks
-deploy/                  compose overrides (key file, admin key, host networking) and tokens.example.json
-Dockerfile, docker-compose.yml, Caddyfile, .env.example
-```
+Everything else is in **[docs/reference.md](docs/reference.md)**: every setup option, the admin HTTP API, all configuration variables, the security model, reliability behaviour, logging and metrics, test results, and the repository layout.
