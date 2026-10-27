@@ -2,8 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/ed25519"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -18,32 +16,27 @@ func run(t *testing.T, args ...string) (string, string, error) {
 	return out.String(), errb.String(), err
 }
 
-func TestAddIsSignedByDefault(t *testing.T) {
-	file := filepath.Join(t.TempDir(), "tokens.json")
-	if _, _, err := run(t, "add", "-file", file, "-id", "alice"); err != errSignedDefault {
-		t.Fatalf("add without key: %v", err)
+func TestAllowIPs(t *testing.T) {
+	file := t.TempDir() + "/tokens.json"
+	if _, _, err := run(t, "add", "-file", file, "-id", "a", "-allow-ips", "1.2.3.4,nope"); err == nil {
+		t.Fatal("invalid -allow-ips accepted")
 	}
-	pub := tokens.FormatPublicKey(ed25519.NewKeyFromSeed(make([]byte, 32)).Public().(ed25519.PublicKey))
-	if _, _, err := run(t, "add", "-file", file, "-id", "x", "-pubkey", pub, "-unsigned"); err == nil {
-		t.Fatal("-pubkey with -unsigned accepted")
+	tok, msg, err := run(t, "add", "-file", file, "-id", "a", "-allow-ips", "203.0.113.7, 10.0.0.0/8")
+	if err != nil || !strings.HasPrefix(tok, tokens.Prefix) || strings.Contains(msg, "any IP") {
+		t.Fatalf("add: %q %q %v", tok, msg, err)
 	}
-	tok, _, err := run(t, "add", "-file", file, "-id", "alice", "-pubkey", pub, "-concurrency", "4")
-	if err != nil || !strings.HasPrefix(tok, tokens.Prefix) {
-		t.Fatalf("signed add: %q %v", tok, err)
-	}
-	tok2, msg, err := run(t, "add", "-file", file, "-id", "bot", "-unsigned")
-	if err != nil || !strings.HasPrefix(tok2, tokens.Prefix) || !strings.Contains(msg, "Unsigned") {
-		t.Fatalf("unsigned add: %q %q %v", tok2, msg, err)
-	}
-	f, _ := tokens.Read(file)
-	s := tokens.NewStore(f)
-	pa, _ := s.Authenticate(strings.TrimSpace(tok), time.Now())
-	pb, _ := s.Authenticate(strings.TrimSpace(tok2), time.Now())
-	if !pa.SignatureRequired() || pb.SignatureRequired() {
-		t.Fatalf("alice signed=%v bot signed=%v", pa.SignatureRequired(), pb.SignatureRequired())
+	if _, msg, _ := run(t, "add", "-file", file, "-id", "b"); !strings.Contains(msg, "any IP") {
+		t.Fatalf("no hint for unrestricted token: %q", msg)
 	}
 	list, _, _ := run(t, "list", "-file", file)
-	if !strings.Contains(list, "k_") || !strings.Contains(list, "(unsigned)") {
+	if !strings.Contains(list, "203.0.113.7,10.0.0.0/8") || !strings.Contains(list, "any") {
 		t.Fatalf("list:\n%s", list)
+	}
+	if _, _, err := run(t, "set", "-file", file, "-id", "a", "-allow-ips", "*"); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := tokens.Read(file)
+	if c := f.Find("a"); len(c.AllowedIPs) != 0 {
+		t.Fatalf("allowlist not cleared: %v", c.AllowedIPs)
 	}
 }

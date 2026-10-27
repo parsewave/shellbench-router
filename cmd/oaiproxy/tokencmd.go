@@ -20,7 +20,7 @@ import (
 // go through tokens.Update, so they never race the admin API or each other.
 func tokenCmd(args []string, stdout, stderr io.Writer, now time.Time) error {
 	if len(args) == 0 {
-		return errors.New("token: missing subcommand (add, list, rotate, revoke, enable, set, remove, add-key, remove-key)")
+		return errors.New("token: missing subcommand (add, list, rotate, revoke, enable, set, remove)")
 	}
 	sub, args := args[0], args[1:]
 	flags := flag.NewFlagSet("token "+sub, flag.ContinueOnError)
@@ -34,10 +34,7 @@ func tokenCmd(args []string, stdout, stderr io.Writer, now time.Time) error {
 	expires := flags.String("expires", "", "expiry: duration (90d, 12h), date (2027-01-31), RFC3339, or never")
 	note := flags.String("note", "", "free-form note")
 	grace := flags.String("grace", "0", "rotate: how long the old token stays valid (0 = revoke now)")
-	pubkey := flags.String("pubkey", "", "add/add-key: the user's Ed25519 public key (ed25519:<base64> from `pxkey generate`, or PEM)")
-	unsigned := flags.Bool("unsigned", false, "add: create a plain bearer token without request signing (for tools that can't sign)")
-	keyID := flags.String("key-id", "", "remove-key: id of the signing key (see list)")
-	allowUnsigned := flags.Bool("allow-unsigned", false, "remove-key: allow removing the last key, turning signing off")
+	allowIPs := flags.String("allow-ips", "", "comma-separated IPs / CIDR ranges the token works from; empty or * = any")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -70,7 +67,14 @@ func tokenCmd(args []string, stdout, stderr io.Writer, now time.Time) error {
 		if set["note"] {
 			c.Note = *note
 		}
-		if set["expires"] && sub != "add-key" {
+		if set["allow-ips"] {
+			ips, err := tokens.ParseIPList(*allowIPs)
+			if err != nil {
+				return fmt.Errorf("-allow-ips: %w", err)
+			}
+			c.AllowedIPs = ips
+		}
+		if set["expires"] {
 			t, err := tokens.ParseExpiry(*expires, now)
 			if err != nil {
 				return fmt.Errorf("-expires: %w", err)
@@ -90,12 +94,6 @@ func tokenCmd(args []string, stdout, stderr io.Writer, now time.Time) error {
 	err := tokens.Update(*file, sub == "add", func(f *tokens.File) error {
 		switch sub {
 		case "add":
-			if *pubkey == "" && !*unsigned {
-				return errSignedDefault
-			}
-			if *pubkey != "" && *unsigned {
-				return errors.New("-pubkey and -unsigned are mutually exclusive")
-			}
 			nc := tokens.Client{ID: *id}
 			if err := apply(&nc); err != nil {
 				return err
@@ -105,14 +103,8 @@ func tokenCmd(args []string, stdout, stderr io.Writer, now time.Time) error {
 				return err
 			}
 			msg = fmt.Sprintf("Created client %q. Its token is printed below exactly once; store it securely.", *id)
-			if *pubkey != "" {
-				k, err := f.AddKey(*id, *pubkey, "", nil, now)
-				if err != nil {
-					return err
-				}
-				msg += fmt.Sprintf("\nSigning key %s registered: requests must be signed.", k.ID)
-			} else {
-				msg += "\nUnsigned: this token alone grants access, so treat it like a password."
+			if len(nc.AllowedIPs) == 0 {
+				msg += "\nIt works from any IP; consider -allow-ips so a leaked copy is useless elsewhere."
 			}
 		case "rotate":
 			g, err := tokens.ParseDuration(*grace)
@@ -143,26 +135,6 @@ func tokenCmd(args []string, stdout, stderr io.Writer, now time.Time) error {
 			}
 		case "remove":
 			return f.Remove(*id)
-		case "add-key":
-			if *pubkey == "" {
-				return errors.New("-pubkey is required")
-			}
-			exp, err := tokens.ParseExpiry(*expires, now)
-			if err != nil {
-				return fmt.Errorf("-expires: %w", err)
-			}
-			k, err := f.AddKey(*id, *pubkey, *note, exp, now)
-			if err != nil {
-				return err
-			}
-			msg = fmt.Sprintf("Registered signing key %s for %q; its requests must now be signed.", k.ID, *id)
-		case "remove-key":
-			if *keyID == "" {
-				return errors.New("-key-id is required")
-			}
-			if err := f.RemoveKey(*id, *keyID, *allowUnsigned); err != nil {
-				return err
-			}
 		default:
 			return fmt.Errorf("token: unknown subcommand %q", sub)
 		}
@@ -181,15 +153,11 @@ func tokenCmd(args []string, stdout, stderr io.Writer, now time.Time) error {
 	return nil
 }
 
-// errSignedDefault explains the default: tokens are tied to the user's key.
-var errSignedDefault = errors.New("signed tokens are the default: pass -pubkey ed25519:... (the user gets it from `pxkey generate`), " +
-	"or -unsigned for a plain bearer token (only for tools that can't sign)")
-
 func listClients(stdout io.Writer, f *tokens.File, now time.Time) error {
 	tw := tabwriter.NewWriter(stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tSTATUS\tMODELS\tRPM\tBURST\tCONCURRENCY\tEXPIRES\tSECRETS\tSIGNING KEYS")
+	fmt.Fprintln(tw, "ID\tSTATUS\tMODELS\tRPM\tBURST\tCONCURRENCY\tEXPIRES\tALLOWED IPS\tSECRETS")
 	for _, c := range f.Clients {
-		var hints, keys []string
+		var hints []string
 		for _, s := range c.Secrets {
 			h := s.Hint
 			if s.ExpiresAt != nil {
@@ -197,17 +165,11 @@ func listClients(stdout io.Writer, f *tokens.File, now time.Time) error {
 			}
 			hints = append(hints, h)
 		}
-		for _, k := range c.PublicKeys {
-			kk := k.ID
-			if k.ExpiresAt != nil {
-				kk += " (until " + k.ExpiresAt.Format(time.RFC3339) + ")"
-			}
-			keys = append(keys, kk)
+		ips := "any"
+		if len(c.AllowedIPs) > 0 {
+			ips = strings.Join(c.AllowedIPs, ",")
 		}
-		if len(keys) == 0 {
-			keys = []string{"- (unsigned)"}
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", c.ID, c.Status(now), orAll(c.Models), limit(c.RPM), limit(c.Burst), limit(c.MaxConcurrent), fmtTime(c.ExpiresAt), strings.Join(hints, ", "), strings.Join(keys, ", "))
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", c.ID, c.Status(now), orAll(c.Models), limit(c.RPM), limit(c.Burst), limit(c.MaxConcurrent), fmtTime(c.ExpiresAt), ips, strings.Join(hints, ", "))
 	}
 	return tw.Flush()
 }

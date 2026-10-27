@@ -6,15 +6,13 @@
 // (ADMIN_API_KEY_FILE); without one the API is disabled and /admin/ is 404.
 //
 //	GET    /admin/clients                     list clients
-//	POST   /admin/clients                     create (needs "public_key", or "unsigned": true); returns the token once
+//	POST   /admin/clients                     create; returns the token once
 //	GET    /admin/clients/{id}                show one client
-//	PATCH  /admin/clients/{id}                change models, limits, expiry, note
+//	PATCH  /admin/clients/{id}                change models, limits, allowed IPs, expiry, note
 //	DELETE /admin/clients/{id}                delete
 //	POST   /admin/clients/{id}/rotate         new token; {"grace":"24h"} keeps the old one
 //	POST   /admin/clients/{id}/revoke         disable immediately
 //	POST   /admin/clients/{id}/enable         re-enable
-//	POST   /admin/clients/{id}/keys           register a request-signing public key
-//	DELETE /admin/clients/{id}/keys/{key_id}  remove a signing key
 package admin
 
 import (
@@ -69,8 +67,6 @@ func (s *Server) init() {
 	m.HandleFunc("POST /admin/clients/{id}/rotate", s.rotate)
 	m.HandleFunc("POST /admin/clients/{id}/revoke", s.setDisabled(true))
 	m.HandleFunc("POST /admin/clients/{id}/enable", s.setDisabled(false))
-	m.HandleFunc("POST /admin/clients/{id}/keys", s.addKey)
-	m.HandleFunc("DELETE /admin/clients/{id}/keys/{key}", s.removeKey)
 	s.mux = m
 }
 
@@ -121,30 +117,28 @@ type secretView struct {
 }
 
 type clientView struct {
-	ID                string             `json:"id"`
-	Status            string             `json:"status"`
-	Note              string             `json:"note,omitempty"`
-	Models            []string           `json:"models"` // empty = all models
-	RPM               int                `json:"rpm"`
-	Burst             int                `json:"burst"`
-	MaxConcurrent     int                `json:"max_concurrent"`
-	ExpiresAt         *time.Time         `json:"expires_at,omitempty"`
-	SignatureRequired bool               `json:"signature_required"`
-	Secrets           []secretView       `json:"secrets"`
-	PublicKeys        []tokens.PublicKey `json:"public_keys"`
+	ID            string       `json:"id"`
+	Status        string       `json:"status"`
+	Note          string       `json:"note,omitempty"`
+	Models        []string     `json:"models"` // empty = all models
+	RPM           int          `json:"rpm"`
+	Burst         int          `json:"burst"`
+	MaxConcurrent int          `json:"max_concurrent"`
+	AllowedIPs    []string     `json:"allowed_ips"` // empty = any IP
+	ExpiresAt     *time.Time   `json:"expires_at,omitempty"`
+	Secrets       []secretView `json:"secrets"`
 }
 
 func view(c *tokens.Client, now time.Time) clientView {
 	v := clientView{
 		ID: c.ID, Status: c.Status(now), Note: c.Note, Models: c.Models, RPM: c.RPM, Burst: c.Burst,
-		MaxConcurrent: c.MaxConcurrent, ExpiresAt: c.ExpiresAt, SignatureRequired: len(c.PublicKeys) > 0,
-		Secrets: []secretView{}, PublicKeys: c.PublicKeys,
+		MaxConcurrent: c.MaxConcurrent, AllowedIPs: c.AllowedIPs, ExpiresAt: c.ExpiresAt, Secrets: []secretView{},
 	}
 	if v.Models == nil {
 		v.Models = []string{}
 	}
-	if v.PublicKeys == nil {
-		v.PublicKeys = []tokens.PublicKey{}
+	if v.AllowedIPs == nil {
+		v.AllowedIPs = []string{}
 	}
 	for _, sec := range c.Secrets {
 		v.Secrets = append(v.Secrets, secretView{Hint: sec.Hint, CreatedAt: sec.CreatedAt, ExpiresAt: sec.ExpiresAt})
@@ -185,42 +179,20 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, view(c, s.Now()))
 }
 
-type keyRequest struct {
-	PublicKey string `json:"public_key"`
-	Note      string `json:"note"`
-	Expires   string `json:"expires"` // 90d, 2027-01-31, RFC3339, never
-}
-
 type createRequest struct {
 	ID            string   `json:"id"`
 	Models        []string `json:"models"`
 	RPM           int      `json:"rpm"`
 	Burst         int      `json:"burst"`
 	MaxConcurrent int      `json:"max_concurrent"`
+	AllowedIPs    []string `json:"allowed_ips"` // IPs / CIDR ranges; empty or ["*"] = any
 	Expires       string   `json:"expires"`
 	Note          string   `json:"note"`
-	// Signed is the default: give the user's public key (or several), or
-	// set Unsigned for a plain bearer token.
-	PublicKey  string       `json:"public_key"`
-	PublicKeys []keyRequest `json:"public_keys"`
-	Unsigned   bool         `json:"unsigned"`
 }
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	var req createRequest
 	if !s.decode(w, r, &req) {
-		return
-	}
-	if req.PublicKey != "" {
-		req.PublicKeys = append([]keyRequest{{PublicKey: req.PublicKey}}, req.PublicKeys...)
-	}
-	switch {
-	case len(req.PublicKeys) == 0 && !req.Unsigned:
-		writeError(w, http.StatusBadRequest, "public_key_required",
-			`Signed tokens are the default: send the user's "public_key" (from `+"`pxkey generate`"+`), or "unsigned": true for a plain bearer token.`)
-		return
-	case len(req.PublicKeys) > 0 && req.Unsigned:
-		writeError(w, http.StatusBadRequest, "invalid_request", `"unsigned" can't be combined with public keys.`)
 		return
 	}
 	now := s.Now()
@@ -231,18 +203,13 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return badRequest(err)
 		}
-		c := tokens.Client{ID: req.ID, Note: req.Note, Models: normModels(req.Models), RPM: req.RPM, Burst: req.Burst, MaxConcurrent: req.MaxConcurrent, ExpiresAt: exp}
-		if tok, err = f.Add(c, now); err != nil {
+		ips, err := normIPs(req.AllowedIPs)
+		if err != nil {
 			return err
 		}
-		for _, k := range req.PublicKeys {
-			kexp, err := tokens.ParseExpiry(k.Expires, now)
-			if err != nil {
-				return badRequest(err)
-			}
-			if _, err := f.AddKey(req.ID, k.PublicKey, k.Note, kexp, now); err != nil {
-				return err
-			}
+		c := tokens.Client{ID: req.ID, Note: req.Note, Models: normModels(req.Models), RPM: req.RPM, Burst: req.Burst, MaxConcurrent: req.MaxConcurrent, AllowedIPs: ips, ExpiresAt: exp}
+		if tok, err = f.Add(c, now); err != nil {
+			return err
 		}
 		cv = view(f.Find(req.ID), now)
 		return nil
@@ -260,6 +227,7 @@ type patchRequest struct {
 	RPM           *int      `json:"rpm"`
 	Burst         *int      `json:"burst"`
 	MaxConcurrent *int      `json:"max_concurrent"`
+	AllowedIPs    *[]string `json:"allowed_ips"`
 	Expires       *string   `json:"expires"`
 	Note          *string   `json:"note"`
 }
@@ -285,6 +253,13 @@ func (s *Server) patch(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.Note != nil {
 			c.Note = *req.Note
+		}
+		if req.AllowedIPs != nil {
+			ips, err := normIPs(*req.AllowedIPs)
+			if err != nil {
+				return err
+			}
+			c.AllowedIPs = ips
 		}
 		if req.Expires != nil {
 			exp, err := tokens.ParseExpiry(*req.Expires, now)
@@ -354,46 +329,6 @@ func (s *Server) rotate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"client": cv, "token": tok})
 }
 
-func (s *Server) addKey(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	var req keyRequest
-	if !s.decode(w, r, &req) {
-		return
-	}
-	var k tokens.PublicKey
-	var cv clientView
-	now := s.Now()
-	err := s.update(false, func(f *tokens.File) error {
-		exp, err := tokens.ParseExpiry(req.Expires, now)
-		if err != nil {
-			return badRequest(err)
-		}
-		if k, err = f.AddKey(id, req.PublicKey, req.Note, exp, now); err != nil {
-			return err
-		}
-		cv = view(f.Find(id), now)
-		return nil
-	})
-	if err != nil {
-		s.fail(w, r, id, err)
-		return
-	}
-	s.applied(r, id, "add_key", "key_id", k.ID)
-	writeJSON(w, http.StatusCreated, map[string]any{"client": cv, "key": k})
-}
-
-func (s *Server) removeKey(w http.ResponseWriter, r *http.Request) {
-	id, keyID := r.PathValue("id"), r.PathValue("key")
-	allowUnsigned := r.URL.Query().Get("allow_unsigned") == "true"
-	err := s.update(false, func(f *tokens.File) error { return f.RemoveKey(id, keyID, allowUnsigned) })
-	if err != nil {
-		s.fail(w, r, id, err)
-		return
-	}
-	s.applied(r, id, "remove_key", "key_id", keyID)
-	w.WriteHeader(http.StatusNoContent)
-}
-
 // mutate runs fn on client id under the tokens-file lock and responds with
 // the updated client.
 func (s *Server) mutate(w http.ResponseWriter, r *http.Request, id, action string, fn func(*tokens.File, *tokens.Client, time.Time) error) {
@@ -458,8 +393,6 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, id string, err err
 		writeError(w, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, tokens.ErrExists):
 		writeError(w, http.StatusConflict, "already_exists", err.Error())
-	case errors.Is(err, tokens.ErrLastKey):
-		writeError(w, http.StatusConflict, "last_signing_key", err.Error())
 	case errors.As(err, &ue):
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 	default:
@@ -484,6 +417,10 @@ func (s *Server) decode(w http.ResponseWriter, r *http.Request, v any) bool {
 		return false
 	}
 	return true
+}
+
+func normIPs(ips []string) ([]string, error) {
+	return tokens.ParseIPList(strings.Join(ips, ","))
 }
 
 func normModels(m []string) []string {

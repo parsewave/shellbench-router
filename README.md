@@ -1,6 +1,6 @@
 # shellbench-router: authenticated OpenAI-compatible API gateway
 
-A small Go reverse proxy that lets a model provider share access to their API account **without sharing their API key**. The provider hosts the gateway with their real key (OpenAI, OpenRouter, PackyAPI, or any OpenAI-compatible API). Each consumer gets their own proxy token, which can be revoked, rotated, expired, and limited independently. Clients keep using the standard OpenAI SDKs. Tokens are tied to a private key on the user's machine by default, so a leaked token is useless; plain tokens are available for tools that can't sign.
+A small Go reverse proxy that lets a model provider share access to their API account **without sharing their API key**. The provider hosts the gateway with their real key (OpenAI, OpenRouter, PackyAPI, or any OpenAI-compatible API). Each user gets their own proxy token, which can be revoked, rotated, expired, limited, and locked to the user's IP addresses. Clients keep using the standard OpenAI SDKs and tools; only `base_url` and `api_key` change.
 
 ```
 client (OpenAI SDK)                 provider's server                                  upstream
@@ -28,9 +28,9 @@ Contents: **[Getting started](#getting-started)** · [Setup details](#1-setup-de
 Two people are involved:
 
 * **The admin** runs the gateway and holds the real provider API key.
-* **Users** get a token that works only from their own machine. They never see the real key.
+* **Users** get a proxy token (`sk-px-…`) and use it like a normal OpenAI key. They never see the real key.
 
-Tokens are **signed by default**: each user creates a private key on their own machine, and their token only works together with that key. A token that leaks into a log, a repo or a chat message is useless to anyone else.
+Each token can be **locked to the user's IP addresses**, so a token that leaks into a log, a repo or a chat message is useless from anywhere else.
 
 ### Step 1 (admin): start the gateway
 
@@ -55,70 +55,55 @@ export PX_ADMIN_KEY=sk-pxadmin-...
 pxadmin list
 ```
 
-### Step 3 (user): create your key
+### Step 3 (admin): create a token for each user
+
+Ask the user which IP address their requests will come from. They can find out with `curl -s https://api.ipify.org` on that machine. Then:
 
 ```bash
-pip install "pxclient[openai] @ git+https://github.com/parsewave/shellbench-router.git#subdirectory=clients/python"
-pxkey generate
+pxadmin add alice --allow-ips 198.51.100.24 --models gpt-4o-mini --expires 90d
 ```
 
-This writes your private key to `~/.pxkey/private.pem`, which never leaves your machine, and prints one line like `ed25519:Mf3k…q9A=`. **Send that line to the admin.** It isn't secret.
+This prints alice's token and a ready-to-send message with the base URL, token and models. Send it to her.
 
-### Step 4 (admin): create the user
+* `--allow-ips` takes a comma-separated list of addresses and ranges, for example `198.51.100.24,10.0.0.0/8`. Leave it out to allow any IP, but then anyone holding a copy of the token can use it.
+* Leave out `--models` to allow every model. The default limit is 16 concurrent requests; change it with `--concurrency`.
 
-```bash
-pxadmin add alice --pubkey ed25519:Mf3k...q9A= --models gpt-4o-mini --expires 90d
-```
+### Step 4 (user): use it
 
-This prints alice's token and a ready-to-send message with the base URL, token and models. Send it to her. The default limit is 16 concurrent requests; change it with `--concurrency`.
-
-### Step 5 (user): use it
+Any OpenAI SDK or tool works. Change only the base URL and key:
 
 ```python
-from pxclient import signed_openai
+from openai import OpenAI
 
-client = signed_openai(
-    base_url="https://203-0-113-7.sslip.io/v1",
-    api_key="sk-px-...",                 # from the admin
-    key_file="~/.pxkey/private.pem",     # from step 3
-)
+client = OpenAI(base_url="https://203-0-113-7.sslip.io/v1", api_key="sk-px-...")
 reply = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}])
 print(reply.choices[0].message.content)
 ```
 
-Apart from creating the client, this is the normal OpenAI SDK: streaming, `responses`, `embeddings` and `signed_async_openai` all work the same way.
+```bash
+# Or, for tools and harnesses that read the standard environment variables (Harbor agents, Codex, LiteLLM, ...):
+export OPENAI_BASE_URL=https://203-0-113-7.sslip.io/v1
+export OPENAI_API_KEY=sk-px-...
+```
 
 ### Everyday admin commands
 
 ```bash
-pxadmin list                          # everyone, their status, models, limits, expiry
-pxadmin revoke alice                  # cut someone off now (pxadmin enable alice to undo)
-pxadmin rotate alice --grace 24h      # new token; the old one keeps working for 24h
-pxadmin set alice --models '*'        # change models, --rpm, --concurrency or --expires
-pxadmin add-key alice --pubkey ...    # let alice use a second machine
-pxadmin remove alice                  # delete
+pxadmin list                                  # everyone: status, allowed IPs, models, limits, expiry
+pxadmin revoke alice                          # cut someone off now (pxadmin enable alice to undo)
+pxadmin rotate alice --grace 24h              # new token; the old one keeps working for 24h
+pxadmin set alice --allow-ips 198.51.100.24,203.0.113.0/24   # change IPs, --models, --rpm, --concurrency or --expires
+pxadmin remove alice                          # delete
 ```
 
-On the server itself, `scripts/keys.sh` does the same things (`scripts/keys.sh list`, `scripts/keys.sh add -id alice -pubkey ...`, and so on), and `docker compose logs -f proxy` shows every request with its token usage.
-
-### Tools that can't sign
-
-Some tools only accept a base URL and an API key (Cursor, many CLIs, curl). For those, create a plain token:
-
-```bash
-pxadmin add ci-bot --unsigned --models gpt-4o-mini --concurrency 4
-```
-
-The user sets `OPENAI_BASE_URL=https://203-0-113-7.sslip.io/v1` and `OPENAI_API_KEY=sk-px-…`, and any OpenAI SDK or tool works. Anyone who gets a copy of an unsigned token can use it until you revoke it, so give these tight limits and an expiry.
+On the server itself, `scripts/keys.sh` does the same things (`scripts/keys.sh list`, `scripts/keys.sh add -id alice -allow-ips 198.51.100.24 ...`, and so on), and `docker compose logs -f proxy` shows every request with its client IP and token usage.
 
 ### If something fails
 
 | Error | Meaning |
 |---|---|
 | `401 invalid_api_key` | The token is wrong, expired or revoked. |
-| `401 signature_required` | This token is signed: use `signed_openai`, not plain `OpenAI`. |
-| `401 invalid_signature` | Wrong `key_file`, or the admin registered a different public key. |
-| `401 signature_expired` | Your computer's clock is more than 2 minutes off. |
+| `403 ip_not_allowed` | The token is locked to other IPs. The message shows the address the gateway saw; ask the admin to add it. |
 | `403 model_not_allowed` | Ask the admin for access to that model. |
 | `429` | You hit your rate or concurrency limit. The SDK retries automatically. |
 
@@ -136,10 +121,10 @@ git clone https://github.com/parsewave/shellbench-router.git && cd shellbench-ro
 # Interactive: asks for provider, hostname and the upstream key (input hidden)
 scripts/setup.sh
 
-# Or fully specified, e.g. OpenRouter with a first (signed) client:
+# Or fully specified, e.g. OpenRouter with a first client:
 scripts/setup.sh --provider openrouter --domain auto \
   --referer https://github.com/your-org/your-app --title "My Benchmark" \
-  --client alice --client-pubkey ed25519:... --client-models 'openai/*,anthropic/*' --client-concurrency 64
+  --client alice --client-allow-ips 198.51.100.24 --client-models 'openai/*,anthropic/*' --client-concurrency 64
 ```
 
 `setup.sh` does the following:
@@ -148,12 +133,12 @@ scripts/setup.sh --provider openrouter --domain auto \
 3. Creates the admin API key in `secrets/admin_api_key` (same protection) and enables `/admin/`. Skip this with `--no-admin`.
 4. Runs `docker compose up -d --build` and waits for the proxy to report healthy.
 5. Optionally creates the first client token and prints it **once**.
-6. Checks `https://<host>/healthz` end to end, and `GET /v1/models` too when the first client is unsigned.
+6. Checks `https://<host>/healthz` end to end, and `GET /v1/models` too when the first client has no IP allowlist.
 7. Prints the gateway URL and the admin key, **once**.
 
 Non-interactive (CI or automation): `UPSTREAM_KEY=… scripts/setup.sh --provider openai --domain llm.example.com --yes`.
 
-Options: `--provider openai|openrouter|packy|custom`, `--base-url URL` (custom), `--domain NAME|auto`, `--host-network`, `--referer`/`--title` (OpenRouter attribution), `--no-admin`, `--client ID` with `--client-pubkey KEY` or `--client-unsigned`, `--client-models LIST`, `--client-concurrency N`, `--force`, `--yes`.
+Options: `--provider openai|openrouter|packy|custom`, `--base-url URL` (custom), `--domain NAME|auto`, `--host-network`, `--referer`/`--title` (OpenRouter attribution), `--no-admin`, `--client ID`, `--client-allow-ips LIST`, `--client-models LIST`, `--client-concurrency N`, `--force`, `--yes`.
 
 **Host networking.** `--host-network` adds `deploy/docker-compose.host.yml`. Caddy and the proxy then use the host network, with the proxy bound to `127.0.0.1:8080`. Use it on hosts where Docker can't create more networks ("all predefined address pools have been fully subnetted"), or to skip the docker-proxy hop under heavy load.
 
@@ -192,10 +177,8 @@ There are two kinds of keys: **client tokens**, which you hand out, and the **up
 ### Client tokens: `scripts/keys.sh`
 
 ```bash
-scripts/keys.sh add -id alice -pubkey ed25519:... -models gpt-4o-mini,o3* -rpm 600 -concurrency 32 -expires 90d   # prints token once
-scripts/keys.sh add -id bot -unsigned -concurrency 4              # plain bearer token, all models
-scripts/keys.sh add-key -id alice -pubkey ed25519:...             # another signing key (e.g. second machine)
-scripts/keys.sh remove-key -id alice -key-id k_0123456789ab
+scripts/keys.sh add -id alice -allow-ips 198.51.100.24 -models gpt-4o-mini,o3* -rpm 600 -concurrency 32 -expires 90d   # prints token once
+scripts/keys.sh add -id bob -concurrency 64                       # any IP, all models
 scripts/keys.sh list                                              # status, limits, expiry, hints; never full tokens
 scripts/keys.sh set    -id alice -models 'openai/*' -rpm 1200 -expires never
 scripts/keys.sh rotate -id alice -grace 24h                       # new token; old one valid 24h more (default 0 = revoked now)
@@ -203,20 +186,20 @@ scripts/keys.sh revoke -id alice                                  # immediate; u
 scripts/keys.sh remove -id alice                                  # delete entirely
 scripts/keys.sh check  sk-px-… [model]                            # verify a token end-to-end through HTTPS
 
-TOKEN=$(scripts/keys.sh add -id carol -unsigned)    # only the token goes to stdout
+TOKEN=$(scripts/keys.sh add -id carol)    # only the token goes to stdout
 ```
 
 * `keys.sh` wraps `docker compose run --rm --no-deps proxy token …`. Without Docker, the same commands are `oaiproxy token …`, run against `TOKENS_FILE`.
 * **Format and storage.** Tokens are `sk-px-` plus 256 random bits. Only `sha256(token)` and a 4-character hint are stored, in `/config/tokens.json` on the `proxy_config` volume. The file is written atomically with mode 0600. See `deploy/tokens.example.json` for the format.
 * **Changes apply within about 2 seconds** without a restart. `kill -HUP` forces an immediate reload. An invalid file is rejected and the previous one stays active. A missing file fails closed: every request gets 401.
 * **Model patterns** are exact and case-sensitive. A trailing `*` matches by prefix. An empty list or `*` allows every model. Restricted tokens see only their allowed models in `GET /v1/models`.
-* **Signed by default.** `add` needs the user's `-pubkey` (from `pxkey generate`), or `-unsigned` for a plain token.
+* **IP allowlists.** `-allow-ips 198.51.100.24,10.0.0.0/8` (IPv4 or IPv6 addresses and CIDR ranges); `-allow-ips '*'` clears it. Requests from other addresses get `403 ip_not_allowed`. The client IP is the address Caddy saw, taken from the last `X-Forwarded-For` entry and only when the connection comes from a trusted proxy (`TRUSTED_PROXIES`, default loopback and private ranges), so clients can't fake it. Unknown tokens still get 401, so the allowlist reveals nothing to them.
 * **Limits.** `rpm` is a token bucket (`burst` defaults to `rpm`), and `concurrency` caps in-flight requests per token. When a limit is hit, the proxy returns 429 with `Retry-After` immediately rather than queuing; SDK retries handle it. New tokens are unlimited by default, so **give every client a `-concurrency` limit** so one client can't use all of `MAX_INFLIGHT`.
 * Revoking a token doesn't cut streams already in flight; they end normally or at `UPSTREAM_TIMEOUT`.
 
 ### Admin API (HTTP)
 
-The same operations are available over HTTPS, so tokens can be managed without SSH. `pxadmin` (step 2 of Getting started) wraps it; the raw endpoints are below. `setup.sh` enables it. On older deployments, or to rotate the key:
+The same operations are available over HTTPS, so tokens can be managed without SSH. `pxadmin` (Getting started, step 2) wraps it; the raw endpoints are below. `setup.sh` enables it. On older deployments, or to rotate the key:
 
 ```bash
 scripts/keys.sh admin-key      # prints the admin key once; rerun to rotate it (no restart)
@@ -228,28 +211,19 @@ This writes `secrets/admin_api_key` (owner-only, like the upstream key), adds `d
 A="Authorization: Bearer $ADMIN_KEY"; B=https://llm.example.com
 
 curl -H "$A" $B/admin/clients                                                     # list (never shows tokens)
-curl -H "$A" $B/admin/clients -d '{"id":"alice","public_key":"ed25519:...","models":["gpt-4o-mini","o3*"],"rpm":600,"max_concurrent":32,"expires":"90d"}'
+curl -H "$A" $B/admin/clients -d '{"id":"alice","allowed_ips":["198.51.100.24"],"models":["gpt-4o-mini","o3*"],"rpm":600,"max_concurrent":32,"expires":"90d"}'
                                                                                   # -> 201 {"client":{...},"token":"sk-px-..."} (token shown once)
-curl -H "$A" $B/admin/clients -d '{"id":"bot","unsigned":true,"max_concurrent":4}'  # plain bearer token
 curl -H "$A" $B/admin/clients/alice
 curl -H "$A" -X PATCH $B/admin/clients/alice -d '{"rpm":1200,"models":["*"]}'      # only the given fields change
 curl -H "$A" -X POST  $B/admin/clients/alice/rotate -d '{"grace":"24h"}'          # -> new token; old one valid 24h
 curl -H "$A" -X POST  $B/admin/clients/alice/revoke                               # or /enable
 curl -H "$A" -X DELETE $B/admin/clients/alice
-curl -H "$A" $B/admin/clients/alice/keys -d '{"public_key":"ed25519:...","note":"ci box"}'   # require signing
-curl -H "$A" -X DELETE $B/admin/clients/alice/keys/k_0123456789ab                 # 409 if it is the last key, unless ?allow_unsigned=true
 ```
 
-* Fields: `models` (`[]` or `["*"]` = all), `rpm`, `burst`, `max_concurrent`, `expires` (`90d`, `12h`, `2027-01-31`, RFC3339, `never`), `note`. Create also needs `public_key` (or a list `public_keys: [{"public_key","note","expires"}]`), or `"unsigned": true`; otherwise it returns `400 public_key_required`. Unknown fields are rejected.
+* Fields: `models` (`[]` or `["*"]` = all), `allowed_ips` (`[]` or `["*"]` = any IP), `rpm`, `burst`, `max_concurrent`, `expires` (`90d`, `12h`, `2027-01-31`, RFC3339, `never`), `note`. Unknown fields are rejected.
 * Changes apply immediately. The API and the CLI edit `tokens.json` under a shared file lock, so concurrent changes from either are never lost.
 * Every change is logged (`"msg":"admin change"`, action, client, remote address); tokens and the admin key never are.
 * The admin key is all-powerful: keep it in a password manager, not in scripts or chat. Rotate it with `scripts/keys.sh admin-key`.
-
-### Request signing (leak-resistant tokens)
-
-A bearer token works for anyone who has a copy. Signed clients (the default; see Getting started for the flow) also have an **Ed25519 public key** registered, and the proxy requires every request to be **signed with the matching private key**. A leaked token is useless on its own, and so is a leaked private key without the token. Private keys can also be made with `openssl genpkey -algorithm ed25519 -out private.pem`; `pxkey public --key private.pem` prints the line to register.
-
-What is signed (`internal/signing`): `PX-ED25519-V1`, method, host, path and query, timestamp, a per-request nonce, and the SHA-256 of the body, sent as `X-Px-Timestamp`, `X-Px-Nonce`, `X-Px-Signature`. The proxy accepts timestamps within `SIGNATURE_MAX_SKEW` (default 2m) and rejects reused nonces, so a captured request can't be altered or replayed. Errors: `signature_required`, `malformed_signature`, `signature_expired` (check the client clock), `invalid_signature`, `signature_replayed`. Keys can have an expiry; a client may hold up to 8, so rotate by adding the new key before removing the old one. Tools that only accept a base URL and API key (no custom HTTP client) can't sign; create those clients with `--unsigned`. `scripts/keys.sh check` sends unsigned requests, so it reports `401 signature_required` for signed clients; that is expected.
 
 ### Upstream key: `scripts/keys.sh upstream-key`
 
@@ -322,7 +296,7 @@ All configuration is through environment variables (`.env`). See `.env.example`.
 | `ACCESS_LOG_FILE` | — | Optional JSONL access log. Put it on its own rotated volume. |
 | `SHUTDOWN_TIMEOUT` | 30s | Grace period for in-flight requests on SIGTERM |
 | `ADMIN_API_KEY_FILE` / `ADMIN_API_KEY` | — | Enables the admin API at `/admin/` (set up by `scripts/keys.sh admin-key`). File form is hot-reloaded. |
-| `SIGNATURE_MAX_SKEW` | 2m | Accepted clock difference for signed requests (10s–1h) |
+| `TRUSTED_PROXIES` | loopback + private ranges | Peers whose `X-Forwarded-For` is used as the client IP for allowlists (Caddy). Never expose the proxy port itself. |
 
 Default routes: `GET /v1/models`, `GET /v1/models/*`, `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/responses/input_tokens`, `GET|DELETE /v1/responses/*`, `POST /v1/responses/*/cancel`, `GET /v1/responses/*/input_items`, `POST /v1/embeddings`. Any other path returns 404 without contacting the upstream. Clients always call `/v1/...`; the gateway maps that onto the upstream base path (e.g. OpenRouter's `/api/v1`).
 
@@ -477,10 +451,9 @@ Load testing: `tools/loadgen` drives concurrent requests (`-c`, `-d`, `-stream`,
 ```
 cmd/oaiproxy/            binary: serve, token CLI, healthcheck
 internal/proxy/          handler, routing, JSON model scanner, retries, limits, usage tap, metrics (+ tests)
-internal/tokens/         token file format, hashing, rotation, signing keys, locked updates (+ tests)
-internal/signing/        request-signature format, verification, replay cache (+ tests)
+internal/tokens/         token file format, hashing, rotation, IP allowlists, locked updates (+ tests)
 internal/admin/          admin HTTP API under /admin/ (+ tests)
-clients/python/          pxclient: signing transport for httpx / the OpenAI SDK, `pxkey` CLI (+ tests)
+clients/python/          pxclient: the `pxadmin` CLI for the admin API (+ tests)
 internal/config/         environment configuration, upstream key file reloading (+ tests)
 internal/mockupstream/   fake OpenAI API used by tests, the mock tool and benchmarks
 tools/mockupstream/      standalone mock upstream (also shipped in the image, for load tests)

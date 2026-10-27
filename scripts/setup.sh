@@ -4,7 +4,7 @@
 # client token.
 #
 #   scripts/setup.sh                                  # interactive
-#   scripts/setup.sh --provider openrouter --domain auto --client alice --client-pubkey ed25519:...
+#   scripts/setup.sh --provider openrouter --domain auto --client alice --client-allow-ips 203.0.113.7
 #   UPSTREAM_KEY=sk-... scripts/setup.sh --provider openai --domain llm.example.com --yes
 #
 # Run it from anywhere; it operates on the repository it lives in.
@@ -29,8 +29,7 @@ Deployment:
 
 First client (optional):
   --client ID              create a client token with this id (printed once)
-  --client-pubkey KEY      the user's public key from `pxkey generate` (signed token; the default)
-  --client-unsigned        create a plain bearer token instead (for tools that can't sign)
+  --client-allow-ips LIST  only accept it from these IPs / CIDR ranges (comma-separated)
   --client-models LIST     restrict it to these models (comma-separated, prefix* ok)
   --client-concurrency N   max concurrent requests for it (default 64)
 
@@ -41,7 +40,7 @@ EOF
 }
 
 PROVIDER="" BASE_URL="" REFERER="" TITLE="" DOMAIN="" HOST_NET=0 FORCE=0 YES=0
-CLIENT="" CLIENT_MODELS="" CLIENT_CONC=64 CLIENT_PUBKEY="" CLIENT_UNSIGNED=0 ADMIN=1
+CLIENT="" CLIENT_MODELS="" CLIENT_CONC=64 CLIENT_IPS="" ADMIN=1
 while [ $# -gt 0 ]; do
 	case $1 in
 	--provider) PROVIDER=$2; shift 2 ;;
@@ -54,8 +53,7 @@ while [ $# -gt 0 ]; do
 	--client) CLIENT=$2; shift 2 ;;
 	--client-models) CLIENT_MODELS=$2; shift 2 ;;
 	--client-concurrency) CLIENT_CONC=$2; shift 2 ;;
-	--client-pubkey) CLIENT_PUBKEY=$2; shift 2 ;;
-	--client-unsigned) CLIENT_UNSIGNED=1; shift ;;
+	--client-allow-ips) CLIENT_IPS=$2; shift 2 ;;
 	--no-admin) ADMIN=0; shift ;;
 	--yes) YES=1; shift ;;
 	-h | --help) usage; exit 0 ;;
@@ -75,9 +73,6 @@ ask() { # ask VAR "prompt" [default]
 command -v docker >/dev/null || die "docker is not installed"
 docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
 [ -f docker-compose.yml ] || die "run from the repository (docker-compose.yml not found)"
-if [ -n "$CLIENT" ] && [ -z "$CLIENT_PUBKEY" ] && [ "$CLIENT_UNSIGNED" != 1 ]; then
-	die "--client needs --client-pubkey (the user's key from \`pxkey generate\`) or --client-unsigned"
-fi
 if [ -e .env ] && [ "$FORCE" != 1 ]; then
 	die ".env already exists. Re-run with --force to replace it, or manage keys with scripts/keys.sh"
 fi
@@ -195,7 +190,7 @@ say "Proxy healthy (upstream key fingerprint ${fp:-?})"
 if [ -n "$CLIENT" ]; then
 	args=(add -id "$CLIENT" -concurrency "$CLIENT_CONC")
 	[ -n "$CLIENT_MODELS" ] && args+=(-models "$CLIENT_MODELS")
-	if [ -n "$CLIENT_PUBKEY" ]; then args+=(-pubkey "$CLIENT_PUBKEY"); else args+=(-unsigned); fi
+	[ -n "$CLIENT_IPS" ] && args+=(-allow-ips "$CLIENT_IPS")
 	TOKEN=$(docker compose run --rm --no-deps -T proxy token "${args[@]}" 2>/dev/null) || die "could not create client $CLIENT"
 	say "Client '$CLIENT' created. Its token (shown once; store it securely):"
 	printf '%s\n' "$TOKEN"
@@ -210,7 +205,7 @@ for _ in $(seq 30); do
 done
 if [ "$ok" = 1 ]; then
 	say "https://$DOMAIN/healthz is up"
-	if [ -n "${TOKEN:-}" ] && [ -z "$CLIENT_PUBKEY" ]; then # signed tokens can only be checked from the user's machine
+	if [ -n "${TOKEN:-}" ] && [ -z "$CLIENT_IPS" ]; then # an allowlisted token may not work from this host
 		n=$(curl -fsS -m 30 -H "Authorization: Bearer $TOKEN" "https://$DOMAIN/v1/models" | grep -o '"id"' | wc -l | tr -d ' ') &&
 			say "Upstream reachable: $n models visible to '$CLIENT'" ||
 			say "Upstream check failed: GET /v1/models did not succeed (check the key and base URL)"
@@ -233,7 +228,7 @@ Admin key (shown once; put it in your password manager):
 Manage tokens from your own machine:
   pip install "pxclient @ git+https://github.com/parsewave/shellbench-router.git#subdirectory=clients/python"
   export PX_ADMIN_URL=https://$DOMAIN PX_ADMIN_KEY=<the key above>
-  pxadmin add alice --pubkey ed25519:...      # the user's key from \`pxkey generate\`
+  pxadmin add alice --allow-ips <their IP>
 EOF
 	ADMIN_KEY=""
 fi

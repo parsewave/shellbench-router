@@ -1,8 +1,7 @@
 // Package proxy implements the authenticated OpenAI-compatible reverse proxy.
 //
-// Request path: authenticate proxy token -> match an allowed route -> apply
-// per-client limits -> inspect the JSON body for the model -> verify the
-// request signature (clients with signing keys) -> rewrite headers
+// Request path: authenticate proxy token -> check the client's IP allowlist -> match an allowed route -> apply
+// per-client limits -> inspect the JSON body for the model -> rewrite headers
 // (client token out, provider key in) -> httputil.ReverseProxy, which streams
 // the upstream response back unmodified (SSE is flushed per write).
 package proxy
@@ -11,7 +10,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -23,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -31,7 +30,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"oaiproxy/internal/signing"
 	"oaiproxy/internal/tokens"
 )
 
@@ -56,9 +54,11 @@ type Options struct {
 	MaxBufferedBytes  int64             // global cap on buffered request bodies, default 1 GiB
 	Transport         http.RoundTripper // nil = tuned http.Transport
 	Logger            *slog.Logger
-	AccessLog         io.Writer     // optional JSONL sink
-	Metrics           *Metrics      // optional
-	SignatureMaxSkew  time.Duration // accepted clock difference for signed requests, default 2m
+	AccessLog         io.Writer // optional JSONL sink
+	Metrics           *Metrics  // optional
+	// TrustedProxies are the peers (Caddy) whose X-Forwarded-For is used as
+	// the client IP for allowlists. Default: loopback and private ranges.
+	TrustedProxies []netip.Prefix
 }
 
 type Proxy struct {
@@ -71,7 +71,6 @@ type Proxy struct {
 	buffered atomic.Int64 // bytes reserved by in-flight request bodies
 	unauthS  atomic.Int64 // log sampling for unauthenticated requests
 	unauthN  atomic.Int64
-	nonces   *signing.NonceCache
 	log      *slog.Logger
 	accessMu sync.Mutex
 }
@@ -104,13 +103,13 @@ func New(o Options) (*Proxy, error) {
 	if o.MaxRetryWait <= 0 {
 		o.MaxRetryWait = 20 * time.Second
 	}
-	if o.SignatureMaxSkew <= 0 {
-		o.SignatureMaxSkew = 2 * time.Minute
+	if o.TrustedProxies == nil {
+		o.TrustedProxies = DefaultTrustedProxies
 	}
 	if o.Transport == nil {
 		o.Transport = NewTransport()
 	}
-	p := &Proxy{opt: o, routes: routes, log: o.Logger, nonces: signing.NewNonceCache(o.SignatureMaxSkew, 0)}
+	p := &Proxy{opt: o, routes: routes, log: o.Logger}
 	p.store.Store(tokens.NewStore(&tokens.File{Version: 1}))
 	rt := &retryTransport{base: o.Transport, max: o.MaxRetries, maxWait: o.MaxRetryWait, baseWait: o.RetryBaseWait, capWait: 8 * time.Second}
 	if o.Metrics != nil {
@@ -183,8 +182,7 @@ type reqState struct {
 	path       string
 	client     string
 	principal  *tokens.Principal
-	keyID      string // signing key that verified the request
-	bodySum    [sha256.Size]byte
+	clientIP   netip.Addr
 	route      string
 	model      string
 	stream     bool
@@ -214,6 +212,7 @@ func stateFrom(ctx context.Context) *reqState {
 func (p *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 	st := &reqState{id: newRequestID(), start: time.Now(), method: r.Method, path: truncate(r.URL.Path, 256), clientCtx: r.Context(), rc: http.NewResponseController(w)}
 	w.Header().Set("X-Proxy-Request-Id", st.id)
+	st.clientIP = p.clientIP(r)
 	defer func() {
 		if v := recover(); v != nil {
 			// httputil.ReverseProxy panics with http.ErrAbortHandler when a
@@ -249,16 +248,11 @@ func (p *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	st.client, st.principal = pr.ID, pr
 
-	// 1b. Clients with signing keys must also sign. The headers are checked
-	// here, before any limits or body reads; the signature itself covers the
-	// body, so it is verified once the body has been read (step 4).
-	var sig signing.Headers
-	if pr.SignatureRequired() {
-		if sig, err = signing.ParseHeaders(r.Header.Get(signing.HeaderTimestamp), r.Header.Get(signing.HeaderNonce),
-			r.Header.Get(signing.HeaderSignature), st.start, p.opt.SignatureMaxSkew); err != nil {
-			p.failSignature(w, st, err)
-			return
-		}
+	// 1b. Tokens with an IP allowlist only work from those addresses.
+	if len(pr.AllowedIPs) > 0 && !pr.AllowsIP(st.clientIP) {
+		p.fail(w, st, http.StatusForbidden, "invalid_request_error", "ip_not_allowed",
+			fmt.Sprintf("This proxy token can't be used from %s. Ask the operator to add this address to its allowlist.", st.clientIP))
+		return
 	}
 
 	// 2. Only explicitly configured endpoints are forwarded.
@@ -297,9 +291,6 @@ func (p *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 	if !p.prepareBody(w, r, st, pr) {
 		return
 	}
-	if pr.SignatureRequired() && !p.verifySignature(w, r, st, pr, sig) {
-		return
-	}
 	if route.Pattern == "GET /v1/models/*" {
 		id := r.URL.Path[len("/v1/models/"):]
 		st.model = id
@@ -331,7 +322,6 @@ func (p *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 // model restrictions. The body must be buffered to know the model before
 // forwarding; this also makes the narrow set of safe retries possible.
 func (p *Proxy) prepareBody(w http.ResponseWriter, r *http.Request, st *reqState, pr *tokens.Principal) bool {
-	st.bodySum = emptySum
 	switch r.Method {
 	case http.MethodPost, http.MethodPut, http.MethodPatch:
 	default:
@@ -363,9 +353,6 @@ func (p *Proxy) prepareBody(w http.ResponseWriter, r *http.Request, st *reqState
 		}
 		p.fail(w, st, status, "invalid_request_error", code, err.Error())
 		return false
-	}
-	if pr.SignatureRequired() {
-		st.bodySum = sha256.Sum256(body)
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
@@ -403,47 +390,6 @@ func (p *Proxy) prepareBody(w http.ResponseWriter, r *http.Request, st *reqState
 		}
 	}
 	return true
-}
-
-var emptySum = sha256.Sum256(nil)
-
-// verifySignature checks the request signature against the client's keys
-// and burns its nonce. Bodies of GET/DELETE requests are never forwarded, so
-// they are signed as empty.
-func (p *Proxy) verifySignature(w http.ResponseWriter, r *http.Request, st *reqState, pr *tokens.Principal, h signing.Headers) bool {
-	uri := r.RequestURI
-	if uri == "" {
-		uri = r.URL.RequestURI()
-	}
-	msg := signing.StringToSign(r.Method, r.Host, uri, h.Timestamp, h.Nonce, st.bodySum[:])
-	keyID, err := signing.Verify(pr.Keys, h, msg, st.start)
-	if err == nil {
-		err = p.nonces.Use(pr.ID, h.Nonce, st.start)
-	}
-	if err != nil {
-		p.failSignature(w, st, err)
-		return false
-	}
-	st.keyID = keyID
-	return true
-}
-
-func (p *Proxy) failSignature(w http.ResponseWriter, st *reqState, err error) {
-	st.err = err.Error()
-	switch err {
-	case signing.ErrBusy:
-		w.Header().Set("Retry-After", "1")
-		p.fail(w, st, http.StatusServiceUnavailable, "server_error", err.Error(), "The proxy is at capacity; retry shortly.")
-		return
-	case signing.ErrMissing:
-		p.fail(w, st, http.StatusUnauthorized, "invalid_request_error", err.Error(), "This proxy token requires signed requests; use the signing client.")
-	case signing.ErrStale:
-		p.fail(w, st, http.StatusUnauthorized, "invalid_request_error", err.Error(), "Request signature timestamp is outside the allowed window; check the client clock.")
-	case signing.ErrReplayed:
-		p.fail(w, st, http.StatusUnauthorized, "invalid_request_error", err.Error(), "Request signature was already used.")
-	default:
-		p.fail(w, st, http.StatusUnauthorized, "invalid_request_error", err.Error(), "Invalid request signature.")
-	}
 }
 
 func (p *Proxy) readBody(w http.ResponseWriter, r *http.Request, st *reqState) ([]byte, int, error) {
@@ -743,6 +689,57 @@ func writeError(w http.ResponseWriter, status int, typ, code, msg string) {
 	w.Write(errorJSON(typ, code, msg))
 }
 
+// DefaultTrustedProxies covers where Caddy runs: the same host (loopback,
+// host networking) or a Docker network (private ranges). The proxy port
+// itself must not be reachable from the internet.
+var DefaultTrustedProxies = []netip.Prefix{
+	netip.MustParsePrefix("127.0.0.0/8"), netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"), netip.MustParsePrefix("fc00::/7"),
+}
+
+// clientIP is the address the request came from. Behind a trusted proxy it
+// is the last X-Forwarded-For entry: the one that proxy appended itself, so
+// anything a client puts in the header is ignored.
+func (p *Proxy) clientIP(r *http.Request) netip.Addr {
+	peer, err := netip.ParseAddrPort(r.RemoteAddr)
+	if err != nil {
+		return netip.Addr{}
+	}
+	ip := peer.Addr().Unmap()
+	if !p.trusted(ip) {
+		return ip
+	}
+	xff := r.Header.Values("X-Forwarded-For")
+	if len(xff) == 0 {
+		return ip
+	}
+	last := xff[len(xff)-1]
+	if i := strings.LastIndexByte(last, ','); i >= 0 {
+		last = last[i+1:]
+	}
+	if fwd, err := netip.ParseAddr(strings.TrimSpace(last)); err == nil {
+		return fwd.Unmap()
+	}
+	return ip
+}
+
+func (p *Proxy) trusted(ip netip.Addr) bool {
+	for _, pfx := range p.opt.TrustedProxies {
+		if pfx.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func addrString(a netip.Addr) string {
+	if !a.IsValid() {
+		return ""
+	}
+	return a.String()
+}
+
 func bearerToken(r *http.Request) string {
 	h := r.Header.Get("Authorization")
 	if len(h) > 7 && strings.EqualFold(h[:7], "Bearer ") {
@@ -782,7 +779,7 @@ type accessRecord struct {
 	RequestID         string  `json:"request_id"`
 	UpstreamRequestID string  `json:"upstream_request_id,omitempty"`
 	Client            string  `json:"client"`
-	KeyID             string  `json:"key_id,omitempty"`
+	ClientIP          string  `json:"client_ip,omitempty"`
 	Method            string  `json:"method"`
 	Endpoint          string  `json:"endpoint,omitempty"`
 	Path              string  `json:"path"`
@@ -808,7 +805,7 @@ func (p *Proxy) record(st *reqState) {
 	}
 	rec := accessRecord{
 		Time: st.start.UTC().Format(time.RFC3339Nano), RequestID: st.id, UpstreamRequestID: st.upstreamID,
-		Client: orDash(st.client), KeyID: st.keyID, Method: st.method, Endpoint: st.route, Path: st.path, Model: st.model,
+		Client: orDash(st.client), ClientIP: addrString(st.clientIP), Method: st.method, Endpoint: st.route, Path: st.path, Model: st.model,
 		Stream: st.stream, Status: st.status, UpstreamStatus: st.upstreamSt,
 		LatencyMS: ms(st.latency), TTFBMS: ms(st.ttfb), Retries: st.retries,
 		InputTokens: st.usage.Input, OutputTokens: st.usage.Output, ReasoningTokens: st.usage.Reasoning,
@@ -828,8 +825,8 @@ func (p *Proxy) record(st *reqState) {
 			slog.String("model", rec.Model), slog.Bool("stream", rec.Stream), slog.Int("status", rec.Status),
 			slog.Float64("latency_ms", rec.LatencyMS), slog.Int("retries", rec.Retries),
 		}
-		if rec.KeyID != "" {
-			attrs = append(attrs, slog.String("key_id", rec.KeyID))
+		if rec.ClientIP != "" {
+			attrs = append(attrs, slog.String("client_ip", rec.ClientIP))
 		}
 		if rec.UpstreamStatus != 0 {
 			attrs = append(attrs, slog.Int("upstream_status", rec.UpstreamStatus))
