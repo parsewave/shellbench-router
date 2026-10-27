@@ -1,0 +1,11 @@
+# Never send secrets or local state to the Docker build context.
+# Leading "/" anchors to the context root (so internal/config is kept).
+/.env
+/.env.*
+/secrets
+/config
+**/*.jsonl
+/.git
+/tests
+/tools/loadgen
+/scripts

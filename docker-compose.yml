@@ -1,0 +1,53 @@
+services:
+  proxy:
+    build: .
+    image: oaiproxy:latest
+    restart: unless-stopped
+    # Only the proxy receives the upstream key; Caddy never sees it.
+    env_file: .env
+    environment:
+      TOKENS_FILE: /config/tokens.json
+      LISTEN_ADDR: ":8080"
+      # Prometheus metrics (client ids + usage) are off by default. If enabled,
+      # they are unauthenticated and reachable from any container on this
+      # network, so only enable where that network is trusted.
+      # METRICS_ADDR: ":9090"
+    volumes:
+      - proxy_config:/config
+      # The upstream key file is mounted by deploy/docker-compose.keyfile.yml
+      # (enabled via COMPOSE_FILE in .env; scripts/setup.sh does all of this).
+    expose:
+      - "8080"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "/oaiproxy", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: { max-size: "50m", max-file: "5" }
+
+  caddy:
+    image: caddy:2.11-alpine
+    restart: unless-stopped
+    depends_on:
+      proxy:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      PROXY_DOMAIN: ${PROXY_DOMAIN:?set PROXY_DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  proxy_config:
+  caddy_data:
+  caddy_config:

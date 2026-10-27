@@ -1,0 +1,13 @@
+# Supply the upstream key as a file instead of an env var (env vars are
+# visible via `docker inspect`). Prepare it once on the host:
+#
+#   install -d -m 700 secrets
+#   (umask 077; cat > secrets/upstream_api_key)      # paste key, Ctrl-D
+#   sudo chown 65532:65532 secrets/upstream_api_key && sudo chmod 0400 secrets/upstream_api_key
+#
+# and in .env set UPSTREAM_API_KEY_FILE=/run/secrets/upstream_api_key (and no
+# UPSTREAM_API_KEY). The file is re-read when it changes: rotate by replacing it.
+services:
+  proxy:
+    volumes:
+      - ./secrets/upstream_api_key:/run/secrets/upstream_api_key:ro

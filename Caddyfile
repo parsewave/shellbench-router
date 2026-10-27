@@ -1,0 +1,39 @@
+{
+	# Optionally add: email ops@example.com  (Let's Encrypt contact)
+	# Caddy's access log is off by default; keep it that way or it will
+	# record request metadata. Authorization headers are redacted by Caddy
+	# even if you enable it.
+}
+
+{$PROXY_DOMAIN} {
+	request_body {
+		max_size 64MB
+	}
+
+	@api path /v1/* /healthz
+	handle @api {
+		# PROXY_UPSTREAM is 127.0.0.1:8080 with deploy/docker-compose.host.yml.
+		reverse_proxy {$PROXY_UPSTREAM:proxy:8080} {
+			# Forward SSE bytes immediately; never buffer streams.
+			flush_interval -1
+			transport http {
+				dial_timeout 5s
+				# No response_header_timeout: reasoning requests can take many
+				# minutes before the first byte. The Go proxy enforces timeouts.
+				# Must be shorter than the proxy's 120s idle timeout, or Caddy may
+				# reuse a connection the proxy is closing (spurious 502s).
+				keepalive 90s
+			}
+		}
+	}
+
+	# Everything else (including /metrics) is not exposed.
+	handle {
+		respond 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+}

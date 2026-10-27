@@ -1,0 +1,8 @@
+# secrets and local state (anchored so internal/config is kept)
+/.env
+/.env.*
+!/.env.example
+/secrets/
+/config/
+*.jsonl
+/oaiproxy

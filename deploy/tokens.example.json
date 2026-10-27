@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "clients": [
+    {
+      "id": "alice",
+      "note": "benchmark harness A; hashes below are placeholders, create real entries with `oaiproxy token add`",
+      "models": ["gpt-4o", "gpt-4o-mini", "o3*"],
+      "rpm": 600,
+      "max_concurrent": 64,
+      "expires_at": "2027-06-30T00:00:00Z",
+      "secrets": [
+        {
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "hint": "sk-px-AAAA...",
+          "created_at": "2026-10-27T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": "bob",
+      "note": "unrestricted models, mid-rotation (old secret valid for 24h)",
+      "rpm": 1200,
+      "burst": 200,
+      "max_concurrent": 128,
+      "secrets": [
+        {
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "hint": "sk-px-BBBB...",
+          "created_at": "2026-09-01T00:00:00Z",
+          "expires_at": "2026-10-28T00:00:00Z"
+        },
+        {
+          "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "hint": "sk-px-CCCC...",
+          "created_at": "2026-10-27T00:00:00Z"
+        }
+      ]
+    }
+  ]
+}

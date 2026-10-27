@@ -1,0 +1,28 @@
+# Host-networking override, for hosts where creating Docker networks is
+# undesirable or impossible (address pools exhausted) and to avoid the
+# docker-proxy hop under heavy load:
+#
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.host.yml up -d
+#
+# The proxy binds to loopback only; Caddy is the sole public listener.
+# `--profile mock` additionally starts a fake LLM upstream for load tests
+# (point UPSTREAM_BASE_URL=http://127.0.0.1:19999/v1, ALLOW_INSECURE_UPSTREAM=true).
+services:
+  proxy:
+    network_mode: host
+    expose: !reset []
+    environment:
+      LISTEN_ADDR: "127.0.0.1:8080"
+  caddy:
+    network_mode: host
+    ports: !reset []
+    environment:
+      PROXY_UPSTREAM: "127.0.0.1:8080"
+  mock:
+    profiles: [mock]
+    image: oaiproxy:latest
+    network_mode: host
+    entrypoint: ["/mockupstream"]
+    command: ["-addr", "127.0.0.1:19999", "-key", "${MOCK_UPSTREAM_KEY:-sk-mock-upstream}", "-latency", "${MOCK_LATENCY:-300ms}", "-chunk-delay", "${MOCK_CHUNK_DELAY:-20ms}", "-words", "${MOCK_WORDS:-30}"]
+    read_only: true
+    cap_drop: [ALL]
