@@ -445,6 +445,9 @@ var forwardedHeaders = map[string]bool{
 	"User-Agent":          true,
 	"Openai-Beta":         true,
 	"X-Client-Request-Id": true,
+	// Anthropic Messages API: API version and opt-in beta features.
+	"Anthropic-Version": true,
+	"Anthropic-Beta":    true,
 }
 
 func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
@@ -454,8 +457,8 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 		Host:   u.Host,
 		Path:   u.Path + strings.TrimPrefix(in.URL.Path, "/v1"),
 	}
-	if in.Method == http.MethodGet || in.Method == http.MethodDelete {
-		pr.Out.URL.RawQuery = in.URL.RawQuery // e.g. include[], after, stream
+	if in.Method == http.MethodGet || in.Method == http.MethodDelete || strings.HasPrefix(in.URL.Path, "/v1/messages") {
+		pr.Out.URL.RawQuery = in.URL.RawQuery // e.g. include[], after, stream; Anthropic's ?beta=true
 	}
 	pr.Out.Host = ""
 	// The body is fully buffered: no chunking, and no client trailers, which
@@ -740,12 +743,14 @@ func addrString(a netip.Addr) string {
 	return a.String()
 }
 
+// bearerToken is the client's proxy token: "Authorization: Bearer" (OpenAI
+// clients) or "x-api-key" (Anthropic clients such as Claude Code).
 func bearerToken(r *http.Request) string {
 	h := r.Header.Get("Authorization")
 	if len(h) > 7 && strings.EqualFold(h[:7], "Bearer ") {
 		return strings.TrimSpace(h[7:])
 	}
-	return ""
+	return strings.TrimSpace(r.Header.Get("X-Api-Key"))
 }
 
 func newRequestID() string {

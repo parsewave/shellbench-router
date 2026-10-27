@@ -72,6 +72,14 @@ client = OpenAI(base_url="https://203-0-113-7.sslip.io/v1", api_key="sk-px-...")
 print(client.responses.create(model="gpt-4o-mini", input="hi").output_text)
 ```
 
+**Claude Code and Anthropic SDKs** use the same token. The gateway also speaks Anthropic's Messages API (`/v1/messages`), so it works as long as the provider does (OpenRouter does, for every model). Note there's no `/v1` in this URL:
+
+```bash
+export ANTHROPIC_BASE_URL=https://203-0-113-7.sslip.io
+export ANTHROPIC_API_KEY=sk-px-...
+claude --model openai/gpt-6.1-sol        # any model the provider serves over /v1/messages
+```
+
 ---
 
 ## Running Harbor through the gateway
