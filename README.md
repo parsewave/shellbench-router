@@ -275,6 +275,27 @@ This isolates the gateway's own cost. The setup:
 * **The few PackyAPI errors** were streams that the relay ended without its `response.completed` event. The gateway saw a clean upstream close and logged no upstream error.
 * **Cost:** about $1.47 on PackyAPI and $0.0007 on OpenRouter for all real-upstream testing.
 
+### Token throughput (TPS)
+
+Setup: PackyAPI `gpt-6.1-terra`, streaming Responses API, `reasoning.effort: low`, a prompt that asks for a ~250-word story (about 312 visible output tokens per request), 30 s per level (60 s at c=1).
+* **Aggregate output** is all output tokens the upstream reported, reasoning included (1–5% here), divided by wall time.
+* **Per-stream decode** is visible output tokens divided by the time from the first text token to the end of the stream.
+* **TTFT** is time to the first text token.
+* **Proxy CPU** is the share of one core.
+
+| Concurrent streams | Requests | Errors | Aggregate output tok/s | Per-stream decode tok/s, p50 (p10–p90) | TTFT p50 / p95 | Latency p50 / p95 | Proxy CPU |
+|---|---|---|---|---|---|---|---|
+| 1 | 5 | 0 | 31 | 41 (35–42) | 2.7 s / 3.3 s | 10.8 s / 12.1 s | 1% |
+| 10 | 22 | 0 | 240 | 42 (37–45) | 2.6 s / 4.5 s | 9.9 s / 11.2 s | 13% |
+| 50 | 107 | 0 | 1,152 | 41 (38–45) | 2.7 s / 8.9 s | 9.9 s / 11.6 s | 27% |
+| 100 | 207 | 0 | 2,167 | 39 (36–43) | 2.5 s / 3.9 s | 10.1 s / 11.8 s | 50% |
+| 200 | 403 | 0 | 4,199 | 39 (35–42) | 2.6 s / 5.1 s | 10.4 s / 12.6 s | 66% |
+| 300 | 622 | 0.16% | **6,460** | 40 (36–44) | 2.6 s / 7.6 s | 10.3 s / 12.9 s | 93% |
+
+* **Per-stream speed stays at about 40 tok/s at every level, and aggregate TPS scales linearly** with the number of streams. The gateway adds no throughput ceiling in this range; the limit is the upstream model's decode speed, multiplied by how many streams the provider allows.
+* **Cost:** 200,575 output tokens at c=300. The whole TPS ramp cost about $1.22.
+* **To reproduce:** `tools/loadgen -api responses -stream -model gpt-6.1-terra -reasoning-effort low -prompt '…' -csv out.csv`. The CSV has `ttft_ms`, `out_tokens` and `reasoning_tokens` per request.
+
 ## 10. Running the tests
 
 ```bash
@@ -292,7 +313,7 @@ python tests/sdk/test_openai_sdk.py
 ```
 Knobs: `PROXY_RESPONSES_MODEL`, `PROXY_RESTRICTED_MODELS`, `PROXY_EMBED_MODEL=` (skip embeddings), `PROXY_SKIP_RESPONSES_NONSTREAM=1` (relays with empty `output`), `PROXY_CONCURRENT_STREAMS`.
 
-Load testing: `tools/loadgen` drives concurrent requests (`-c`, `-d`, `-stream`, `-api chat|responses`, `-model`, `-max-tokens`, `-error-backoff`, `-csv`, `-json`). `tools/mockupstream` is the fake LLM; with host networking, `docker compose --profile mock up -d` starts it next to the gateway (`UPSTREAM_BASE_URL=http://127.0.0.1:19999/v1`, `ALLOW_INSECURE_UPSTREAM=true`). Against real upstreams, always set `-error-backoff`: workers that hit errors otherwise retry in a tight loop and can trigger provider rate limits.
+Load testing: `tools/loadgen` drives concurrent requests (`-c`, `-d`, `-stream`, `-api chat|responses`, `-model`, `-max-tokens`, `-reasoning-effort`, `-error-backoff`, `-csv`, `-json`). For streams it records latency, TTFB, time to first text token, and output and reasoning tokens from the final usage event, so TPS can be computed from the CSV. `tools/mockupstream` is the fake LLM; with host networking, `docker compose --profile mock up -d` starts it next to the gateway (`UPSTREAM_BASE_URL=http://127.0.0.1:19999/v1`, `ALLOW_INSECURE_UPSTREAM=true`). Against real upstreams, always set `-error-backoff`: workers that hit errors otherwise retry in a tight loop and can trigger provider rate limits.
 
 ## 11. Limitations
 

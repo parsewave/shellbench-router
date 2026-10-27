@@ -26,6 +26,9 @@ import (
 type result struct {
 	start      time.Time
 	lat, ttfb  time.Duration
+	ttft       time.Duration // time to first generated text
+	outTokens  int64         // upstream-reported output tokens (streaming), incl. reasoning
+	reasoning  int64         // of which reasoning tokens
 	status     int
 	errKind    string
 	worker     int
@@ -48,6 +51,7 @@ func main() {
 	csvPath := flag.String("csv", "", "write one CSV row per request")
 	asJSON := flag.Bool("json", false, "print the summary as JSON")
 	api := flag.String("api", "chat", "chat (/chat/completions) or responses (/responses)")
+	effort := flag.String("reasoning-effort", "", "reasoning effort for reasoning models (e.g. minimal, low); empty = provider default")
 	errBackoff := flag.Duration("error-backoff", 0, "pause a worker this long after a failed request (avoid hammering a real upstream)")
 	flag.Parse()
 
@@ -61,12 +65,18 @@ func main() {
 	}
 	switch *api {
 	case "chat":
+		if *effort != "" {
+			req["reasoning_effort"] = *effort
+		}
 	case "responses":
 		path = "/responses"
 		// List form: some relays (e.g. PackyAPI channels) reject string input.
 		req = map[string]any{"model": *model, "stream": *stream, "input": []any{map[string]any{"role": "user", "content": *prompt}}}
 		if *maxTokens > 0 {
 			req["max_output_tokens"] = *maxTokens
+		}
+		if *effort != "" {
+			req["reasoning"] = map[string]any{"effort": *effort}
 		}
 	default:
 		fatal(fmt.Errorf("-api must be chat or responses"))
@@ -130,9 +140,9 @@ func main() {
 			fatal(err)
 		}
 		w := bufio.NewWriter(f)
-		fmt.Fprintln(w, "label,worker,start_unix_ms,latency_ms,ttfb_ms,status,error")
+		fmt.Fprintln(w, "label,worker,start_unix_ms,latency_ms,ttfb_ms,status,error,ttft_ms,out_tokens,reasoning_tokens")
 		for _, r := range results {
-			fmt.Fprintf(w, "%s,%d,%d,%.3f,%.3f,%d,%s\n", *label, r.worker, r.start.UnixMilli(), ms(r.lat), ms(r.ttfb), r.status, r.errKind)
+			fmt.Fprintf(w, "%s,%d,%d,%.3f,%.3f,%d,%s,%.3f,%d,%d\n", *label, r.worker, r.start.UnixMilli(), ms(r.lat), ms(r.ttfb), r.status, r.errKind, ms(r.ttft), r.outTokens, r.reasoning)
 		}
 		w.Flush()
 		f.Close()
@@ -191,12 +201,27 @@ func one(ctx context.Context, client *http.Client, url, token string, body []byt
 		sc.Buffer(make([]byte, 64<<10), 4<<20)
 		for sc.Scan() {
 			line := sc.Text()
-			if r.ttfb == 0 && strings.HasPrefix(line, "data: ") {
+			if !strings.HasPrefix(line, "data: ") {
+				if line == "event: response.completed" {
+					r.streamDone = true
+				}
+				continue
+			}
+			if r.ttfb == 0 {
 				r.ttfb = time.Since(r.start)
+			}
+			data := line[len("data: "):]
+			if r.ttft == 0 && isTextDelta(data) {
+				r.ttft = time.Since(r.start)
+			}
+			if strings.Contains(data, `"usage"`) {
+				if n, rt := outputTokens(data); n > 0 {
+					r.outTokens, r.reasoning = n, rt
+				}
 			}
 			// Chat Completions ends with [DONE]; the Responses API with a
 			// response.completed event.
-			if line == "data: [DONE]" || line == "event: response.completed" {
+			if data == "[DONE]" || strings.Contains(data, `"type":"response.completed"`) {
 				r.streamDone = true
 			}
 		}
@@ -213,6 +238,56 @@ func one(ctx context.Context, client *http.Client, url, token string, body []byt
 	}
 	r.lat = time.Since(r.start)
 	return r
+}
+
+// isTextDelta reports whether an SSE payload carries generated text: a Chat
+// Completions chunk with non-empty delta content, or a Responses
+// output_text.delta event.
+func isTextDelta(data string) bool {
+	if strings.Contains(data, `"type":"response.output_text.delta"`) {
+		return true
+	}
+	i := strings.Index(data, `"content":"`)
+	return i >= 0 && strings.Contains(data, `"delta"`) && !strings.HasPrefix(data[i+len(`"content":"`):], `"`)
+}
+
+type usageInfo struct {
+	CompletionTokens int64 `json:"completion_tokens"`
+	OutputTokens     int64 `json:"output_tokens"`
+	CompletionDetail *struct {
+		ReasoningTokens int64 `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
+	OutputDetail *struct {
+		ReasoningTokens int64 `json:"reasoning_tokens"`
+	} `json:"output_tokens_details"`
+}
+
+// outputTokens extracts output and reasoning token counts from a Chat
+// Completions usage chunk or a Responses response.completed event.
+func outputTokens(data string) (out, reasoning int64) {
+	var v struct {
+		Usage    *usageInfo `json:"usage"`
+		Response *struct {
+			Usage *usageInfo `json:"usage"`
+		} `json:"response"`
+	}
+	if json.Unmarshal([]byte(data), &v) != nil {
+		return 0, 0
+	}
+	u := v.Usage
+	if u == nil && v.Response != nil {
+		u = v.Response.Usage
+	}
+	if u == nil {
+		return 0, 0
+	}
+	if u.CompletionDetail != nil {
+		reasoning += u.CompletionDetail.ReasoningTokens
+	}
+	if u.OutputDetail != nil {
+		reasoning += u.OutputDetail.ReasoningTokens
+	}
+	return u.CompletionTokens + u.OutputTokens, reasoning
 }
 
 func classify(err error) string {
