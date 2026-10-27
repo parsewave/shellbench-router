@@ -212,7 +212,7 @@ All configuration is through environment variables (`.env`). See `.env.example`.
 | `ADMIN_API_KEY_FILE` / `ADMIN_API_KEY` | — | Enables the admin API at `/admin/` (set up by `scripts/keys.sh admin-key`). File form is hot-reloaded. |
 | `TRUSTED_PROXIES` | loopback + private ranges | Peers whose `X-Forwarded-For` is used as the client IP for allowlists (Caddy). Never expose the proxy port itself. |
 
-Default routes: `GET /v1/models`, `GET /v1/models/*`, `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/responses/input_tokens`, `GET|DELETE /v1/responses/*`, `POST /v1/responses/*/cancel`, `GET /v1/responses/*/input_items`, `POST /v1/embeddings`. Any other path returns 404 without contacting the upstream. Clients always call `/v1/...`; the gateway maps that onto the upstream base path (e.g. OpenRouter's `/api/v1`).
+Default routes: `POST /v1/responses`, `POST /v1/responses/compact`, `POST /v1/responses/input_tokens`, `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/embeddings`, `POST /v1/moderations`, `GET /v1/models`, `GET /v1/models/*`, `GET|DELETE /v1/responses/*`, `POST /v1/responses/*/cancel`, `GET /v1/responses/*/input_items`. These are model calls and model listing; nothing that stores files or data on the provider account (files, uploads, batches, vector stores, conversations) or manages it (organization, projects, fine-tuning) is forwarded. Any other path returns 404 without contacting the upstream, logged as a warning with `"error":"unknown_url"` and the path, so `docker compose logs proxy | grep unknown_url` shows what clients asked for. Clients always call `/v1/...`; the gateway maps that onto the upstream base path (e.g. OpenRouter's `/api/v1`).
 
 ## 6. Reliability behaviour
 

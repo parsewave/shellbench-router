@@ -812,7 +812,9 @@ func (p *Proxy) record(st *reqState) {
 		CachedTokens: st.usage.Cached, TotalTokens: st.usage.Total, Error: st.err,
 	}
 	level := slog.LevelInfo
-	if st.status >= 500 || (st.err != "" && st.status < 400) {
+	// Unknown routes are warnings so agents asking for endpoints the
+	// gateway doesn't forward stand out: grep for "unknown_url".
+	if st.status >= 500 || (st.err != "" && st.status < 400) || st.err == "unknown_url" {
 		level = slog.LevelWarn
 	}
 	if st.client == "" && !p.sampleUnauthenticated(st.start) {
