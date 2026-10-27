@@ -1,0 +1,9 @@
+# Enables the admin HTTP API (/admin/clients, see README "Admin API").
+# `scripts/keys.sh admin-key` creates secrets/admin_api_key and adds this file
+# to COMPOSE_FILE in .env; running it again rotates the key in place.
+services:
+  proxy:
+    environment:
+      ADMIN_API_KEY_FILE: /run/secrets/admin_api_key
+    volumes:
+      - ./secrets/admin_api_key:/run/secrets/admin_api_key:ro

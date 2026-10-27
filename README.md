@@ -106,6 +106,56 @@ TOKEN=$(scripts/keys.sh add -id carol)    # only the token goes to stdout
 * **Limits.** `rpm` is a token bucket (`burst` defaults to `rpm`), and `concurrency` caps in-flight requests per token. When a limit is hit, the proxy returns 429 with `Retry-After` immediately rather than queuing; SDK retries handle it. New tokens are unlimited by default, so **give every client a `-concurrency` limit** so one client can't use all of `MAX_INFLIGHT`.
 * Revoking a token doesn't cut streams already in flight; they end normally or at `UPSTREAM_TIMEOUT`.
 
+### Admin API (HTTP)
+
+The same operations are available over HTTPS, so tokens can be managed without SSH. Enable it once on the server:
+
+```bash
+scripts/keys.sh admin-key      # prints the admin key once; rerun to rotate it (no restart)
+```
+
+This writes `secrets/admin_api_key` (owner-only, like the upstream key), adds `deploy/docker-compose.admin.yml` to `COMPOSE_FILE`, and recreates the proxy. Without an admin key, `/admin/` answers 404.
+
+```bash
+A="Authorization: Bearer $ADMIN_KEY"; B=https://llm.example.com
+
+curl -H "$A" $B/admin/clients                                                     # list (never shows tokens)
+curl -H "$A" $B/admin/clients -d '{"id":"alice","models":["gpt-4o-mini","o3*"],"rpm":600,"max_concurrent":32,"expires":"90d"}'
+                                                                                  # -> 201 {"client":{...},"token":"sk-px-..."} (token shown once)
+curl -H "$A" $B/admin/clients/alice
+curl -H "$A" -X PATCH $B/admin/clients/alice -d '{"rpm":1200,"models":["*"]}'      # only the given fields change
+curl -H "$A" -X POST  $B/admin/clients/alice/rotate -d '{"grace":"24h"}'          # -> new token; old one valid 24h
+curl -H "$A" -X POST  $B/admin/clients/alice/revoke                               # or /enable
+curl -H "$A" -X DELETE $B/admin/clients/alice
+curl -H "$A" $B/admin/clients/alice/keys -d '{"public_key":"ed25519:...","note":"ci box"}'   # require signing
+curl -H "$A" -X DELETE $B/admin/clients/alice/keys/k_0123456789ab                 # 409 if it is the last key, unless ?allow_unsigned=true
+```
+
+* Fields: `models` (`[]` or `["*"]` = all), `rpm`, `burst`, `max_concurrent`, `expires` (`90d`, `12h`, `2027-01-31`, RFC3339, `never`), `note`, and on create optionally `public_keys: [{"public_key","note","expires"}]`. Unknown fields are rejected.
+* Changes apply immediately. The API and the CLI edit `tokens.json` under a shared file lock, so concurrent changes from either are never lost.
+* Every change is logged (`"msg":"admin change"`, action, client, remote address); tokens and the admin key never are.
+* The admin key is all-powerful: keep it in a password manager, not in scripts or chat. Rotate it with `scripts/keys.sh admin-key`.
+
+### Request signing (leak-resistant tokens)
+
+A bearer token works for anyone who has a copy. For clients that register an **Ed25519 public key**, the proxy additionally requires every request to be **signed with the matching private key**, so a leaked token (from logs, a repo, a chat message) is useless on its own, and a leaked private key is useless without the token.
+
+1. The client creates a key pair on its own machine; the private key never leaves it:
+   ```bash
+   pip install ./clients/python          # or: openssl genpkey -algorithm ed25519 -out private.pem
+   pxkey generate                        # writes ~/.pxkey/private.pem (0600), prints ed25519:...
+   ```
+2. They send you the printed **public** key (it is not secret) and you register it:
+   `scripts/keys.sh add-key -id alice -pubkey ed25519:...` or `POST /admin/clients/alice/keys`. From then on, alice's unsigned requests get `401 signature_required`.
+3. They use the signing client; everything else is the stock OpenAI SDK:
+   ```python
+   from pxclient import signed_openai          # signed_async_openai for AsyncOpenAI
+   client = signed_openai(base_url="https://llm.example.com/v1", api_key="sk-px-…", key_file="~/.pxkey/private.pem")
+   client.responses.create(model="gpt-4o-mini", input="hi")
+   ```
+
+What is signed (`internal/signing`): `PX-ED25519-V1`, method, host, path and query, timestamp, a per-request nonce, and the SHA-256 of the body, sent as `X-Px-Timestamp`, `X-Px-Nonce`, `X-Px-Signature`. The proxy accepts timestamps within `SIGNATURE_MAX_SKEW` (default 2m) and rejects reused nonces, so a captured request can't be altered or replayed. Errors: `signature_required`, `malformed_signature`, `signature_expired` (check the client clock), `invalid_signature`, `signature_replayed`. Keys can have an expiry; a client may hold up to 8, so rotate by adding the new key before removing the old one. Tools that only accept a base URL and API key (no custom HTTP client) can't sign; keep those clients unsigned.
+
 ### Upstream key: `scripts/keys.sh upstream-key`
 
 ```bash
@@ -176,6 +226,8 @@ All configuration is through environment variables (`.env`). See `.env.example`.
 | `LOG_FORMAT` / `LOG_LEVEL` | `json` / `info` | stdout |
 | `ACCESS_LOG_FILE` | — | Optional JSONL access log. Put it on its own rotated volume. |
 | `SHUTDOWN_TIMEOUT` | 30s | Grace period for in-flight requests on SIGTERM |
+| `ADMIN_API_KEY_FILE` / `ADMIN_API_KEY` | — | Enables the admin API at `/admin/` (set up by `scripts/keys.sh admin-key`). File form is hot-reloaded. |
+| `SIGNATURE_MAX_SKEW` | 2m | Accepted clock difference for signed requests (10s–1h) |
 
 Default routes: `GET /v1/models`, `GET /v1/models/*`, `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/responses/input_tokens`, `GET|DELETE /v1/responses/*`, `POST /v1/responses/*/cancel`, `GET /v1/responses/*/input_items`, `POST /v1/embeddings`. Any other path returns 404 without contacting the upstream. Clients always call `/v1/...`; the gateway maps that onto the upstream base path (e.g. OpenRouter's `/api/v1`).
 
@@ -330,7 +382,10 @@ Load testing: `tools/loadgen` drives concurrent requests (`-c`, `-d`, `-stream`,
 ```
 cmd/oaiproxy/            binary: serve, token CLI, healthcheck
 internal/proxy/          handler, routing, JSON model scanner, retries, limits, usage tap, metrics (+ tests)
-internal/tokens/         token file format, hashing, rotation, constant-time verification (+ tests)
+internal/tokens/         token file format, hashing, rotation, signing keys, locked updates (+ tests)
+internal/signing/        request-signature format, verification, replay cache (+ tests)
+internal/admin/          admin HTTP API under /admin/ (+ tests)
+clients/python/          pxclient: signing transport for httpx / the OpenAI SDK, `pxkey` CLI (+ tests)
 internal/config/         environment configuration, upstream key file reloading (+ tests)
 internal/mockupstream/   fake OpenAI API used by tests, the mock tool and benchmarks
 tools/mockupstream/      standalone mock upstream (also shipped in the image, for load tests)
@@ -339,6 +394,6 @@ tests/sdk/               OpenAI Python SDK compatibility test
 scripts/setup.sh         one-time provider setup
 scripts/keys.sh          client-token and upstream-key management
 scripts/e2e.sh           local end-to-end smoke test + benchmarks
-deploy/                  compose overrides (key file, host networking) and tokens.example.json
+deploy/                  compose overrides (key file, admin key, host networking) and tokens.example.json
 Dockerfile, docker-compose.yml, Caddyfile, .env.example
 ```

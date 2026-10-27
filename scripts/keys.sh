@@ -7,7 +7,10 @@
 #   scripts/keys.sh rotate -id alice -grace 24h
 #   scripts/keys.sh revoke -id alice        # immediate; undo with: enable -id alice
 #   scripts/keys.sh remove -id alice
+#   scripts/keys.sh add-key -id alice -pubkey ed25519:...   # require signed requests
+#   scripts/keys.sh remove-key -id alice -key-id k_...
 #   scripts/keys.sh upstream-key            # replace the provider's upstream key
+#   scripts/keys.sh admin-key               # enable the admin HTTP API / rotate its key
 #   scripts/keys.sh check TOKEN [MODEL]     # verify a client token end-to-end
 #
 # Client tokens are printed once on stdout (everything else on stderr), so
@@ -20,7 +23,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 compose() { docker compose "$@"; }
 
 case ${1:-help} in
-add | list | rotate | revoke | enable | set | remove)
+add | list | rotate | revoke | enable | set | remove | add-key | remove-key)
 	compose run --rm --no-deps -T proxy token "$@"
 	;;
 
@@ -55,6 +58,54 @@ upstream-key)
 	echo "Upstream key active (fingerprint ${fp:-unknown}). Revoke the old key at the provider." >&2
 	;;
 
+admin-key)
+	# Generates the admin API key, prints it once, and enables the API. The
+	# file is overwritten in place (bind-mounted by inode), so rerunning this
+	# rotates the key without a restart.
+	install -d -m 700 secrets
+	KEY="sk-pxadmin-$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')"
+	SUDO=""
+	[ "$(id -u)" = 0 ] || { sudo -n true 2>/dev/null && SUDO=sudo; } || true
+	fresh=0
+	if [ -e secrets/admin_api_key ]; then
+		if [ -w secrets/admin_api_key ]; then
+			printf '%s' "$KEY" >secrets/admin_api_key
+		elif [ -O secrets/admin_api_key ]; then # our own 0444 file (no-sudo setup)
+			chmod u+w secrets/admin_api_key && printf '%s' "$KEY" >secrets/admin_api_key && chmod 0444 secrets/admin_api_key
+		else
+			printf '%s' "$KEY" | $SUDO tee secrets/admin_api_key >/dev/null
+		fi
+	else
+		fresh=1
+		(umask 077 && printf '%s' "$KEY" >secrets/admin_api_key)
+		if [ "$(uname -s)" = Linux ] && { [ -n "$SUDO" ] || [ "$(id -u)" = 0 ]; }; then
+			$SUDO chown 65532:65532 secrets/admin_api_key
+			$SUDO chmod 0400 secrets/admin_api_key
+		else
+			chmod 0444 secrets/admin_api_key
+		fi
+	fi
+	if ! grep -qE '^COMPOSE_FILE=.*deploy/docker-compose.admin.yml' .env; then
+		if grep -qE '^COMPOSE_FILE=' .env; then
+			sed -i.bak -E 's#^(COMPOSE_FILE=.*)$#\1:deploy/docker-compose.admin.yml#' .env && rm -f .env.bak
+		else
+			echo 'COMPOSE_FILE=docker-compose.yml:deploy/docker-compose.admin.yml' >>.env
+		fi
+		fresh=1
+	fi
+	if [ "$fresh" = 1 ]; then
+		echo "Enabling the admin API (recreating the proxy)..." >&2
+		compose up -d proxy >&2
+	else
+		echo "Admin key rotated; the proxy picks it up within seconds." >&2
+	fi
+	DOMAIN=$(grep -E '^PROXY_DOMAIN=' .env | cut -d= -f2-)
+	echo "Admin API: https://$DOMAIN/admin/clients  (Authorization: Bearer <key>)" >&2
+	echo "The admin key is printed below exactly once; store it in a password manager." >&2
+	printf '%s\n' "$KEY"
+	KEY=""
+	;;
+
 check)
 	TOKEN=${2:-}
 	MODEL=${3:-}
@@ -73,7 +124,7 @@ check)
 	;;
 
 help | -h | --help)
-	sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
 	;;
 
 *)

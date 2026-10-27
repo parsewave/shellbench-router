@@ -15,9 +15,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"oaiproxy/internal/admin"
 	"oaiproxy/internal/config"
 	"oaiproxy/internal/proxy"
 	"oaiproxy/internal/tokens"
@@ -36,6 +39,8 @@ commands:
   token enable -id ID       re-enable a revoked client
   token set -id ID [...]    change models / limits / expiry
   token remove -id ID       delete a client
+  token add-key -id ID -pubkey KEY     require signed requests with this key
+  token remove-key -id ID -key-id K    remove a signing key
   healthcheck               exit 0 if the local server is healthy
   version                   print version
 
@@ -106,6 +111,7 @@ func serve() error {
 		Logger:            logger,
 		AccessLog:         access,
 		Metrics:           metrics,
+		SignatureMaxSkew:  cfg.SignatureMaxSkew,
 	})
 	if err != nil {
 		return err
@@ -118,9 +124,14 @@ func serve() error {
 	w.check(true)
 	go w.loop(ctx)
 
+	handler := p.Handler()
+	if cfg.AdminKey != nil {
+		handler = withAdmin(handler, &admin.Server{TokensFile: cfg.TokensFile, Key: cfg.AdminKey, Reload: func() { w.check(true) }, Log: logger})
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           p.Handler(),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 << 10,
@@ -135,7 +146,7 @@ func serve() error {
 	}
 	logger.Info("oaiproxy started", "version", version, "listen", cfg.ListenAddr, "metrics", cfg.MetricsAddr,
 		"upstream", cfg.Upstream.Scheme+"://"+cfg.Upstream.Host+cfg.Upstream.Path,
-		"routes", len(cfg.Routes), "upstream_key_fingerprint", cfg.Key.Fingerprint())
+		"routes", len(cfg.Routes), "upstream_key_fingerprint", cfg.Key.Fingerprint(), "admin_api", cfg.AdminKey != nil)
 
 	select {
 	case err := <-errc:
@@ -151,6 +162,17 @@ func serve() error {
 		srv.Close()
 	}
 	return nil
+}
+
+// withAdmin routes /admin/ to the admin API and everything else to the proxy.
+func withAdmin(api http.Handler, adm http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/admin" || strings.HasPrefix(r.URL.Path, "/admin/") {
+			adm.ServeHTTP(w, r)
+			return
+		}
+		api.ServeHTTP(w, r)
+	})
 }
 
 func metricsMux(m *proxy.Metrics) http.Handler {
@@ -175,6 +197,7 @@ func newLogger(cfg *config.Config) *slog.Logger {
 // change on disk or on SIGHUP. Invalid files are rejected and the previous
 // configuration stays active; a missing token file fails closed.
 type watcher struct {
+	mu      sync.Mutex // check runs from the poll loop and from admin API calls
 	cfg     *config.Config
 	p       *proxy.Proxy
 	log     *slog.Logger
@@ -201,6 +224,8 @@ func (w *watcher) loop(ctx context.Context) {
 }
 
 func (w *watcher) check(force bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	fi, err := os.Stat(w.cfg.TokensFile)
 	switch {
 	case err != nil:
@@ -223,6 +248,13 @@ func (w *watcher) check(force bool) {
 		w.log.Error("upstream key reload failed; keeping previous key", "error", err.Error())
 	} else if changed {
 		w.log.Info("upstream key reloaded", "upstream_key_fingerprint", w.cfg.Key.Fingerprint())
+	}
+	if w.cfg.AdminKey != nil {
+		if changed, err := w.cfg.AdminKey.Reload(); err != nil {
+			w.log.Error("admin key reload failed; keeping previous key", "error", err.Error())
+		} else if changed {
+			w.log.Info("admin key reloaded")
+		}
 	}
 }
 

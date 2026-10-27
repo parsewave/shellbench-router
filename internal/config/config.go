@@ -44,6 +44,8 @@ type Config struct {
 	UpstreamProject   string
 	UpstreamHeaders   http.Header
 	Key               *UpstreamKey
+	AdminKey          *UpstreamKey // nil = admin API disabled
+	SignatureMaxSkew  time.Duration
 	Routes            []string
 	MaxRequestBytes   int64
 	MaxRetries        int
@@ -81,6 +83,7 @@ func Load() (*Config, error) {
 		LogFormat:         str("LOG_FORMAT", "json"),
 		LogLevel:          str("LOG_LEVEL", "info"),
 		AccessLogFile:     str("ACCESS_LOG_FILE", ""),
+		SignatureMaxSkew:  dur("SIGNATURE_MAX_SKEW", 2*time.Minute, &errs),
 	}
 
 	var err error
@@ -122,6 +125,16 @@ func Load() (*Config, error) {
 	c.Key, err = NewUpstreamKey(os.Getenv("UPSTREAM_API_KEY"), os.Getenv("UPSTREAM_API_KEY_FILE"))
 	if err != nil {
 		errs = append(errs, err)
+	}
+	if v, f := os.Getenv("ADMIN_API_KEY"), os.Getenv("ADMIN_API_KEY_FILE"); v != "" || f != "" {
+		if c.AdminKey, err = newKey("ADMIN_API_KEY", "admin API key", v, f); err != nil {
+			errs = append(errs, err)
+		} else if len(c.AdminKey.Get()) < 32 {
+			errs = append(errs, errors.New("admin API key must be at least 32 characters (generate one with scripts/keys.sh admin-key)"))
+		}
+	}
+	if c.SignatureMaxSkew < 10*time.Second || c.SignatureMaxSkew > time.Hour {
+		errs = append(errs, errors.New("SIGNATURE_MAX_SKEW must be between 10s and 1h"))
 	}
 	return c, errors.Join(errs...)
 }
@@ -189,28 +202,35 @@ func ParseUpstream(raw string, allowInsecure bool) (*url.URL, error) {
 // UpstreamKey holds the provider's real API key. When backed by a file it can
 // be reloaded in place, so the key can be rotated without a restart.
 type UpstreamKey struct {
-	file string
-	val  atomic.Pointer[string]
-	mu   sync.Mutex
-	info os.FileInfo
+	label string
+	file  string
+	val   atomic.Pointer[string]
+	mu    sync.Mutex
+	info  os.FileInfo
 }
 
 func NewUpstreamKey(value, file string) (*UpstreamKey, error) {
-	k := &UpstreamKey{file: file}
+	return newKey("UPSTREAM_API_KEY", "upstream API key", value, file)
+}
+
+// newKey loads a secret from env var <env> or file <env>_FILE; the file
+// form is re-read by Reload.
+func newKey(env, label, value, file string) (*UpstreamKey, error) {
+	k := &UpstreamKey{label: label, file: file}
 	switch {
 	case value != "" && file != "":
-		return nil, errors.New("set only one of UPSTREAM_API_KEY and UPSTREAM_API_KEY_FILE")
+		return nil, fmt.Errorf("set only one of %s and %s_FILE", env, env)
 	case file != "":
 		if _, err := k.Reload(); err != nil {
 			return nil, err
 		}
 	case value != "":
-		if err := validKey(value); err != nil {
+		if err := validKey(label, value); err != nil {
 			return nil, err
 		}
 		k.val.Store(&value)
 	default:
-		return nil, errors.New("UPSTREAM_API_KEY or UPSTREAM_API_KEY_FILE is required")
+		return nil, fmt.Errorf("%s or %s_FILE is required", env, env)
 	}
 	return k, nil
 }
@@ -237,17 +257,17 @@ func (k *UpstreamKey) Reload() (bool, error) {
 	defer k.mu.Unlock()
 	fi, err := os.Stat(k.file)
 	if err != nil {
-		return false, fmt.Errorf("upstream key file: %w", err)
+		return false, fmt.Errorf("%s file: %w", k.label, err)
 	}
 	if k.info != nil && os.SameFile(k.info, fi) && fi.ModTime().Equal(k.info.ModTime()) && fi.Size() == k.info.Size() {
 		return false, nil
 	}
 	b, err := os.ReadFile(k.file)
 	if err != nil {
-		return false, fmt.Errorf("upstream key file: %w", err)
+		return false, fmt.Errorf("%s file: %w", k.label, err)
 	}
 	v := strings.TrimSpace(string(b))
-	if err := validKey(v); err != nil {
+	if err := validKey(k.label, v); err != nil {
 		return false, err
 	}
 	k.info = fi
@@ -255,16 +275,16 @@ func (k *UpstreamKey) Reload() (bool, error) {
 	return true, nil
 }
 
-func validKey(v string) error {
+func validKey(label, v string) error {
 	if v == "" {
-		return errors.New("upstream API key is empty")
+		return fmt.Errorf("%s is empty", label)
 	}
 	if len(v) > 1024 {
-		return errors.New("upstream API key is implausibly long")
+		return fmt.Errorf("%s is implausibly long", label)
 	}
 	for i := 0; i < len(v); i++ {
 		if v[i] <= ' ' || v[i] == 0x7f {
-			return errors.New("upstream API key contains whitespace or control characters")
+			return fmt.Errorf("%s contains whitespace or control characters", label)
 		}
 	}
 	return nil

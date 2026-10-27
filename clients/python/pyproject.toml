@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pxclient"
+version = "0.1.0"
+description = "Request-signing client for the shellbench OpenAI-compatible proxy"
+requires-python = ">=3.9"
+dependencies = ["httpx>=0.25", "cryptography>=41"]
+
+[project.optional-dependencies]
+openai = ["openai>=1.40"]
+
+[project.scripts]
+pxkey = "pxclient.cli:main"
+
+[tool.setuptools]
+packages = ["pxclient"]

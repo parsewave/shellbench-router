@@ -6,3 +6,8 @@
 /config/
 *.jsonl
 /oaiproxy
+
+# python client build/test artifacts
+__pycache__/
+*.egg-info/
+.pytest_cache/
