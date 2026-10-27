@@ -277,7 +277,10 @@ func TestOnlyConfiguredRoutes(t *testing.T) {
 	e := newEnv(t, m, nil)
 	for _, c := range []struct{ method, path string }{
 		{"GET", "/v1/files"},
+		{"POST", "/v1/files"},
 		{"POST", "/v1/fine_tuning/jobs"},
+		{"GET", "/v1/organization/admin_api_keys"},
+		{"POST", "/v1/batches"},
 		{"DELETE", "/v1/chat/completions"},
 		{"POST", "/v1/chat/completions/extra"},
 		{"GET", "/v1/models/a%2Fb"},
