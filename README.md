@@ -1,4 +1,4 @@
-# shellbench_proxy: authenticated OpenAI-compatible API gateway
+# shellbench-router: authenticated OpenAI-compatible API gateway
 
 A small Go reverse proxy that lets a model provider share access to their API account **without sharing their API key**. The provider hosts the gateway with their real key (OpenAI, OpenRouter, PackyAPI, or any OpenAI-compatible API). Each consumer gets their own proxy token, which can be revoked, rotated, expired, and limited independently. Clients keep using the standard OpenAI SDKs; only `base_url` and `api_key` change.
 
@@ -19,16 +19,112 @@ client (OpenAI SDK)                 provider's server                           
 * Request bodies are bounded and inspected only for the top-level `model`/`stream` fields. Everything else is forwarded byte-for-byte.
 * Responses are never buffered, and streaming stays streaming.
 
-Contents: [Quick start](#1-quick-start) · [Providers](#2-providers) · [Managing keys](#3-managing-keys) · [Clients](#4-using-the-gateway-clients) · [Configuration](#5-configuration) · [Reliability](#6-reliability-behaviour) · [Logging](#7-logging-and-metrics) · [Security](#8-security-model) · [Results](#9-test-and-benchmark-results) · [Testing](#10-running-the-tests) · [Limitations](#11-limitations) · [Layout](#12-repository-layout)
+Contents: **[Getting started](#getting-started)** · [Setup details](#1-setup-details) · [Providers](#2-providers) · [Managing keys](#3-managing-keys) · [Clients](#4-using-the-gateway-clients) · [Configuration](#5-configuration) · [Reliability](#6-reliability-behaviour) · [Logging](#7-logging-and-metrics) · [Security](#8-security-model) · [Results](#9-test-and-benchmark-results) · [Testing](#10-running-the-tests) · [Limitations](#11-limitations) · [Layout](#12-repository-layout)
 
 ---
 
-## 1. Quick start
+## Getting started
+
+There are two roles: the **operator**, who runs the server and holds the real API key, and **users**, who get a proxy token. Users never see the real key.
+
+### Operator: run the gateway (about 5 minutes)
+
+You need a Linux server with Docker (Compose v2) and ports 80 and 443 open to the internet. A domain name is optional.
+
+**1. Install and start it.**
+
+```bash
+git clone https://github.com/parsewave/shellbench-router.git && cd shellbench-router
+scripts/setup.sh
+```
+
+It asks three things: the provider (OpenAI, OpenRouter, PackyAPI, or any OpenAI-compatible URL), a hostname (press Enter for `auto`, which gives you `https://<your-ip>.sslip.io` with a real HTTPS certificate), and your provider API key (input is hidden). When it finishes, the gateway is live and it prints its URL, for example `https://203-0-113-7.sslip.io`.
+
+**2. Create a token for each user.**
+
+```bash
+scripts/keys.sh add -id alice -models gpt-4o-mini -concurrency 16 -expires 90d
+```
+
+This prints `sk-px-…` **once**. Give every user their own id, so you can see and revoke them separately, and always set `-concurrency` (new tokens are otherwise unlimited). Leave out `-models` to allow every model.
+
+**3. Send the user their details.** For example:
+
+> Base URL: `https://203-0-113-7.sslip.io/v1`
+> API key: `sk-px-…` (just for you; don't commit it or paste it in chat)
+> Models: `gpt-4o-mini`. It works with any OpenAI SDK or tool; just set the base URL and key.
+
+**4. Day to day.**
+
+```bash
+scripts/keys.sh list                          # who has access, limits, expiry
+scripts/keys.sh revoke -id alice              # cut someone off now (enable -id alice to undo)
+scripts/keys.sh rotate -id alice -grace 24h   # new token; the old one keeps working for 24h
+docker compose logs -f proxy                  # live request log with token usage per user
+```
+
+**Optional: manage tokens over HTTP instead of SSH.**
+
+```bash
+scripts/keys.sh admin-key                      # once; prints your admin key (keep it in a password manager)
+
+curl -H "Authorization: Bearer $ADMIN_KEY" https://203-0-113-7.sslip.io/admin/clients \
+  -d '{"id":"bob","models":["gpt-4o-mini"],"max_concurrent":16,"expires":"90d"}'
+# -> {"client":{...},"token":"sk-px-..."}
+```
+
+All endpoints: [Admin API](#admin-api-http).
+
+**Optional: leak-proof tokens for users who run their own code.** Ask the user to run step B2 below and send you the public key it prints, then:
+
+```bash
+scripts/keys.sh add-key -id alice -pubkey ed25519:...
+```
+
+From then on, alice's token only works together with the private key on her machine, so a token that leaks into a log, repo or chat is useless to anyone else.
+
+### User: call the gateway
+
+**B1. Standard: any OpenAI SDK or tool.** Change only the base URL and key:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="https://203-0-113-7.sslip.io/v1", api_key="sk-px-…")
+print(client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}]).choices[0].message.content)
+```
+
+```bash
+# or, for tools that read the standard environment variables:
+export OPENAI_BASE_URL=https://203-0-113-7.sslip.io/v1 OPENAI_API_KEY=sk-px-…
+```
+
+**B2. Signed: if the operator asked you to register a key.**
+
+```bash
+pip install "pxclient[openai] @ git+https://github.com/parsewave/shellbench-router.git#subdirectory=clients/python"
+pxkey generate        # creates ~/.pxkey/private.pem on this machine; send the printed ed25519:... line to the operator
+```
+
+Once the operator has registered it, swap `OpenAI(...)` for `signed_openai(...)`. Everything else stays the same:
+
+```python
+from pxclient import signed_openai
+client = signed_openai(base_url="https://203-0-113-7.sslip.io/v1", api_key="sk-px-…", key_file="~/.pxkey/private.pem")
+print(client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}]).choices[0].message.content)
+```
+
+Never send `private.pem` to anyone; only the `ed25519:...` public key. Signed tokens need a client that can use a custom HTTP client (Python SDK: yes; tools that only take a URL and key: no, so stay on B1 for those).
+
+**If something fails:** `401 invalid_api_key` means the token is wrong, expired or revoked; `401 signature_required` means this token must be used with `signed_openai`; `403 model_not_allowed` means ask the operator for that model; `429` means you hit your concurrency or rate limit (the SDK retries automatically). See [all error codes](#4-using-the-gateway-clients).
+
+---
+
+## 1. Setup details
 
 Prerequisites: a Linux host with Docker and Docker Compose v2, and ports 80/443 reachable from the internet (for Let's Encrypt). A DNS name is optional, since `--domain auto` uses `<public-ip>.sslip.io`.
 
 ```bash
-git clone https://github.com/Parsewave-internal/shellbench_proxy.git && cd shellbench_proxy
+git clone https://github.com/parsewave/shellbench-router.git && cd shellbench-router
 
 # Interactive: asks for provider, hostname and the upstream key (input hidden)
 scripts/setup.sh
@@ -154,7 +250,7 @@ A bearer token works for anyone who has a copy. For clients that register an **E
    client.responses.create(model="gpt-4o-mini", input="hi")
    ```
 
-What is signed (`internal/signing`): `PX-ED25519-V1`, method, host, path and query, timestamp, a per-request nonce, and the SHA-256 of the body, sent as `X-Px-Timestamp`, `X-Px-Nonce`, `X-Px-Signature`. The proxy accepts timestamps within `SIGNATURE_MAX_SKEW` (default 2m) and rejects reused nonces, so a captured request can't be altered or replayed. Errors: `signature_required`, `malformed_signature`, `signature_expired` (check the client clock), `invalid_signature`, `signature_replayed`. Keys can have an expiry; a client may hold up to 8, so rotate by adding the new key before removing the old one. Tools that only accept a base URL and API key (no custom HTTP client) can't sign; keep those clients unsigned.
+What is signed (`internal/signing`): `PX-ED25519-V1`, method, host, path and query, timestamp, a per-request nonce, and the SHA-256 of the body, sent as `X-Px-Timestamp`, `X-Px-Nonce`, `X-Px-Signature`. The proxy accepts timestamps within `SIGNATURE_MAX_SKEW` (default 2m) and rejects reused nonces, so a captured request can't be altered or replayed. Errors: `signature_required`, `malformed_signature`, `signature_expired` (check the client clock), `invalid_signature`, `signature_replayed`. Keys can have an expiry; a client may hold up to 8, so rotate by adding the new key before removing the old one. Tools that only accept a base URL and API key (no custom HTTP client) can't sign; keep those clients unsigned. `scripts/keys.sh check` sends unsigned requests, so it reports `401 signature_required` for signed clients; that is expected.
 
 ### Upstream key: `scripts/keys.sh upstream-key`
 
