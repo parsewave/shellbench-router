@@ -445,6 +445,15 @@ var forwardedHeaders = map[string]bool{
 	"User-Agent":          true,
 	"Openai-Beta":         true,
 	"X-Client-Request-Id": true,
+	// Codex carries routing/continuation state across compaction and turns.
+	"Session-Id":                             true,
+	"Thread-Id":                              true,
+	"Session_id":                             true,
+	"Originator":                             true,
+	"X-Codex-Turn-State":                     true,
+	"X-Codex-Turn-Metadata":                  true,
+	"X-Codex-Beta-Features":                  true,
+	"X-Openai-Internal-Codex-Responses-Lite": true,
 	// Anthropic Messages API: API version and opt-in beta features.
 	"Anthropic-Version": true,
 	"Anthropic-Beta":    true,
