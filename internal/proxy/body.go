@@ -4,12 +4,46 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
+	"mime/multipart"
 )
 
 type bodyInfo struct {
 	model    string
 	hasModel bool
 	stream   bool
+}
+
+// Inspect without rebuilding the upload: file bytes and repeated SDK fields
+// must reach the provider unchanged. Never materialize files or spill to disk.
+func inspectMultipart(b []byte, boundary string) (bodyInfo, error) {
+	var info bodyInfo
+	r := multipart.NewReader(bytes.NewReader(b), boundary)
+	for {
+		part, err := r.NextRawPart()
+		if err == io.EOF {
+			return info, nil
+		}
+		if err != nil {
+			return info, errors.New("malformed multipart request body")
+		}
+		// Disposition ambiguity must not let proxy and provider pick different
+		// field names from the same part and disagree about the model.
+		if len(part.Header.Values("Content-Disposition")) != 1 || part.FormName() == "" {
+			return info, errors.New("multipart part requires one named Content-Disposition")
+		}
+		if part.FormName() != "model" {
+			continue
+		}
+		if info.hasModel || part.FileName() != "" || len(part.Header.Values("Content-Transfer-Encoding")) != 0 {
+			return info, errors.New("multipart body requires one non-file model field")
+		}
+		value, err := io.ReadAll(io.LimitReader(part, 1025))
+		if err != nil || len(value) == 0 || len(value) > 1024 {
+			return info, errors.New("multipart model must contain 1 to 1024 bytes")
+		}
+		info.model, info.hasModel = string(value), true
+	}
 }
 
 // inspectJSON extracts the top-level "model" and "stream" fields from a JSON
