@@ -49,6 +49,7 @@ var DefaultRoutes = []string{
 type Config struct {
 	ListenAddr        string
 	MetricsAddr       string
+	AdminAddr         string
 	TokensFile        string
 	ReloadInterval    time.Duration
 	Upstream          *url.URL
@@ -79,6 +80,7 @@ func Load() (*Config, error) {
 	c := &Config{
 		ListenAddr:        str("LISTEN_ADDR", ":8080"),
 		MetricsAddr:       str("METRICS_ADDR", ""),
+		AdminAddr:         str("ADMIN_LISTEN_ADDR", "127.0.0.1:8081"),
 		TokensFile:        str("TOKENS_FILE", "tokens.json"),
 		ReloadInterval:    dur("TOKENS_RELOAD_INTERVAL", 2*time.Second, &errs),
 		UpstreamOrg:       str("UPSTREAM_ORGANIZATION", ""),

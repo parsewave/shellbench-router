@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -122,25 +121,32 @@ func serve() error {
 	w.check(true)
 	go w.loop(ctx)
 
-	handler := p.Handler()
-	if cfg.AdminKey != nil {
-		handler = withAdmin(handler, &admin.Server{TokensFile: cfg.TokensFile, Key: cfg.AdminKey, Reload: func() { w.check(true) }, Log: logger})
-	}
-
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           handler,
+		Handler:           p.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelDebug),
 	}
-	errc := make(chan error, 2)
-	go func() { errc <- srv.ListenAndServe() }()
+	servers := []*http.Server{srv}
+	if cfg.AdminKey != nil {
+		servers = append(servers, adminServer(cfg, &admin.Server{TokensFile: cfg.TokensFile, Key: cfg.AdminKey, Reload: func() { w.check(true) }, Log: logger}))
+	}
 	if cfg.MetricsAddr != "" {
 		msrv := &http.Server{Addr: cfg.MetricsAddr, Handler: metricsMux(metrics), ReadHeaderTimeout: 5 * time.Second}
-		go func() { errc <- msrv.ListenAndServe() }()
-		defer msrv.Close()
+		servers = append(servers, msrv)
+	}
+	errc := make(chan error, len(servers))
+	for _, server := range servers {
+		// Bind every listener before announcing readiness; a private-listener
+		// failure must not leave a partially started public gateway running.
+		ln, err := net.Listen("tcp", server.Addr)
+		if err != nil {
+			return err
+		}
+		defer server.Close()
+		go func() { errc <- server.Serve(ln) }()
 	}
 	logger.Info("oaiproxy started", "version", version, "listen", cfg.ListenAddr, "metrics", cfg.MetricsAddr,
 		"upstream", cfg.Upstream.Scheme+"://"+cfg.Upstream.Host+cfg.Upstream.Path,
@@ -156,21 +162,17 @@ func serve() error {
 	logger.Info("shutting down", "grace", cfg.ShutdownTimeout.String())
 	sctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
-	if err := srv.Shutdown(sctx); err != nil {
-		srv.Close()
+	for _, server := range servers {
+		if err := server.Shutdown(sctx); err != nil {
+			server.Close()
+		}
 	}
 	return nil
 }
 
-// withAdmin routes /admin/ to the admin API and everything else to the proxy.
-func withAdmin(api http.Handler, adm http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/admin" || strings.HasPrefix(r.URL.Path, "/admin/") {
-			adm.ServeHTTP(w, r)
-			return
-		}
-		api.ServeHTTP(w, r)
-	})
+// Admin never shares the public handler, even when the caller has a valid key.
+func adminServer(cfg *config.Config, adm http.Handler) *http.Server {
+	return &http.Server{Addr: cfg.AdminAddr, Handler: adm, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 }
 
 func metricsMux(m *proxy.Metrics) http.Handler {

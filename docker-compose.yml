@@ -8,6 +8,8 @@ services:
     environment:
       TOKENS_FILE: /config/tokens.json
       LISTEN_ADDR: ":8080"
+      # Private container listener; admin override publishes host-loopback only.
+      ADMIN_LISTEN_ADDR: ":8081"
       # Prometheus metrics (client ids + usage) are off by default. If enabled,
       # they are unauthenticated and reachable from any container on this
       # network, so only enable where that network is trusted.

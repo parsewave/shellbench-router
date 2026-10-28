@@ -38,7 +38,11 @@ Admin key (shown once; put it in your password manager):
 ```bash
 pip install "pxclient @ git+https://github.com/parsewave/shellbench-router.git#subdirectory=clients/python"
 
-export PX_ADMIN_URL=https://203-0-113-7.sslip.io     # your gateway, without /v1
+# Admin is host-only. On your own computer, keep this SSH tunnel open:
+ssh -N -L 127.0.0.1:8081:127.0.0.1:8081 <ssh-user>@203-0-113-7.sslip.io
+
+export PX_PUBLIC_URL=https://203-0-113-7.sslip.io/v1
+export PX_ADMIN_URL=http://127.0.0.1:8081
 export PX_ADMIN_KEY=sk-pxadmin-...                   # the admin key from step 1
 
 pxadmin list                                         # should print "no users yet"

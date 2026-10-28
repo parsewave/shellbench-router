@@ -3,6 +3,8 @@
 # to COMPOSE_FILE in .env; running it again rotates the key in place.
 services:
   proxy:
+    ports:
+      - "127.0.0.1:8081:8081"
     environment:
       ADMIN_API_KEY_FILE: /run/secrets/admin_api_key
     volumes:
