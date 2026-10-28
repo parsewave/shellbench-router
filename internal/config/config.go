@@ -34,6 +34,8 @@ var DefaultRoutes = []string{
 	"POST /v1/responses/*/cancel",
 	"GET /v1/responses/*/input_items",
 	"POST /v1/embeddings",
+	"POST /v1/images/generations",
+	"POST /v1/images/edits",
 	"POST /v1/completions",
 	"POST /v1/moderations",
 	// Anthropic Messages API (Claude Code, Anthropic SDKs).
