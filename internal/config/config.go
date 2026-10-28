@@ -28,6 +28,7 @@ var DefaultRoutes = []string{
 	"POST /v1/chat/completions",
 	"POST /v1/responses",
 	"POST /v1/responses/input_tokens",
+	"POST /v1/alpha/search",
 	"POST /v1/responses/compact",
 	"GET /v1/responses/*",
 	"DELETE /v1/responses/*",

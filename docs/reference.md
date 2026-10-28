@@ -350,6 +350,14 @@ Knobs: `PROXY_RESPONSES_MODEL`, `PROXY_RESTRICTED_MODELS`, `PROXY_EMBED_MODEL=` 
 
 Load testing: `tools/loadgen` drives concurrent requests (`-c`, `-d`, `-stream`, `-api chat|responses`, `-model`, `-max-tokens`, `-reasoning-effort`, `-error-backoff`, `-csv`, `-json`). For streams it records latency, TTFB, time to first text token, and output and reasoning tokens from the final usage event, so TPS can be computed from the CSV. `tools/mockupstream` is the fake LLM; with host networking, `docker compose --profile mock up -d` starts it next to the gateway (`UPSTREAM_BASE_URL=http://127.0.0.1:19999/v1`, `ALLOW_INSECURE_UPSTREAM=true`). Against real upstreams, always set `-error-backoff`: workers that hit errors otherwise retry in a tight loop and can trigger provider rate limits.
 
+### Codex standalone search
+
+`POST /v1/alpha/search` forwards the experimental Codex text-search API. Requests require `model`, a session `id`, and nonempty `search_query`, `open`, `click`, or `find` commands. The normal proxy authentication, IP, model, rate, concurrency, and body limits apply. Feed/media commands are not qualified. Hosted Responses `web_search` remains unchanged.
+
+The upstream session ID is keyed to the proxy principal, fixed upstream URL, organization/project, and current provider credential. Two users choosing the same ID receive different upstream sessions; resume/restart with the same owner is stable. Rotating the provider key or changing owner settings starts a new namespace: start a new search session instead of reusing old page references. No search prompts, results, or session sidecar are persisted by this transform.
+
+Live proof (billable, key injected through `OPENAI_API_KEY`): `SHELLBENCH_OPENAI_LIVE=1 go test ./internal/proxy -run '^TestSearchOpenAILive$' -count=1 -v`. It requires real search output and successfully opens a returned reference.
+
 ## 11. Limitations
 
 * **Stored-object access is account-wide.** All clients share one upstream account, so a client that knows another client's Responses ID (`resp_…`) could fetch, delete or continue it. The IDs are unguessable. If tenants must be fully isolated, remove the `/v1/responses/*` routes and tell clients to send `store: false`, or use one upstream account per tenant.
