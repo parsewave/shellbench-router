@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any, Optional
 
@@ -94,8 +95,7 @@ def _status(c: dict) -> str:
     )
 
 
-def _handoff(admin: Admin, c: dict, token: str) -> str:
-    base = admin.url + "/v1"
+def _handoff(base: str, c: dict, token: str) -> str:
     models = ", ".join(c["models"]) or "all models"
     if c["allowed_ips"]:
         where = f"It only works from {', '.join(c['allowed_ips'])}, so a leaked copy is useless elsewhere."
@@ -128,6 +128,7 @@ def main(argv=None, admin: Optional[Admin] = None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--url", help="gateway URL (default $PX_ADMIN_URL)")
     ap.add_argument("--key", help="admin key (default $PX_ADMIN_KEY or the file in $PX_ADMIN_KEY_FILE)")
+    ap.add_argument("--public-url", help="public model API base URL for token handoffs (default $PX_PUBLIC_URL)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def limits(p, create=False):
@@ -156,13 +157,26 @@ def main(argv=None, admin: Optional[Admin] = None) -> int:
     args = ap.parse_args(argv)
 
     a = admin or _connect(args)
+    if args.cmd in ("add", "rotate"):
+        public = args.public_url or os.environ.get("PX_PUBLIC_URL")
+        # A tunnel's admin address is not a usable model endpoint. Validate
+        # before issuing a token so an error cannot strand its one-time value.
+        if not public:
+            parsed = urlsplit(a.url)
+            if parsed.scheme != "https" or parsed.hostname in ("localhost", "127.0.0.1", "::1"):
+                ap.error("set PX_PUBLIC_URL or --public-url to the public model API base URL")
+            public = a.url + "/v1"
+        parsed = urlsplit(public)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username is not None or parsed.query or parsed.fragment:
+            ap.error("public model API URL must use http(s), with no credentials, query, or fragment")
+        public = public.rstrip("/")
     try:
         if args.cmd == "add":
             fields = _limits(args)
             if fields["max_concurrent"] is None:
                 fields["max_concurrent"] = 16
             out = a.add(args.id, **fields)
-            print(_handoff(a, out["client"], out["token"]), file=sys.stderr)
+            print(_handoff(public, out["client"], out["token"]), file=sys.stderr)
             print(out["token"])
         elif args.cmd == "list":
             clients = a.list()
@@ -176,7 +190,7 @@ def main(argv=None, admin: Optional[Admin] = None) -> int:
             print(_status(a.set(args.id, **_limits(args))))
         elif args.cmd == "rotate":
             out = a.rotate(args.id, args.grace)
-            print(_handoff(a, out["client"], out["token"]), file=sys.stderr)
+            print(_handoff(public, out["client"], out["token"]), file=sys.stderr)
             print(out["token"])
         elif args.cmd in ("revoke", "enable"):
             print(_status(getattr(a, args.cmd)(args.id)))
