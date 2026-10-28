@@ -331,12 +331,13 @@ func (p *Proxy) prepareBody(w http.ResponseWriter, r *http.Request, st *reqState
 	}
 	cts := r.Header.Values("Content-Type")
 	var mt string
+	var params map[string]string
 	if len(cts) > 1 {
 		p.fail(w, st, http.StatusBadRequest, "invalid_request_error", "invalid_content_type", "Multiple Content-Type headers.")
 		return false
 	} else if len(cts) == 1 {
 		var err error
-		if mt, _, err = mime.ParseMediaType(cts[0]); err != nil {
+		if mt, params, err = mime.ParseMediaType(cts[0]); err != nil {
 			p.fail(w, st, http.StatusBadRequest, "invalid_request_error", "invalid_content_type", "Malformed Content-Type header.")
 			return false
 		}
@@ -362,7 +363,10 @@ func (p *Proxy) prepareBody(w http.ResponseWriter, r *http.Request, st *reqState
 		return true
 	}
 
-	if pr.Restricted() {
+	var info bodyInfo
+	if mt == "multipart/form-data" && multipartEndpoint(r.URL.Path) {
+		info, err = inspectMultipart(body, params["boundary"])
+	} else if pr.Restricted() {
 		// The model check only understands JSON, so restricted tokens may
 		// only send JSON, and upstream is told unambiguously that it is JSON.
 		if mt != "" && mt != "application/json" {
@@ -370,10 +374,12 @@ func (p *Proxy) prepareBody(w http.ResponseWriter, r *http.Request, st *reqState
 			return false
 		}
 		r.Header.Set("Content-Type", "application/json")
+		info, err = inspectJSON(body)
 	} else if mt == "multipart/form-data" || mt == "application/x-www-form-urlencoded" {
 		return true
+	} else {
+		info, err = inspectJSON(body)
 	}
-	info, err := inspectJSON(body)
 	if err != nil {
 		p.fail(w, st, http.StatusBadRequest, "invalid_request_error", "invalid_json", err.Error())
 		return false
@@ -390,6 +396,14 @@ func (p *Proxy) prepareBody(w http.ResponseWriter, r *http.Request, st *reqState
 		}
 	}
 	return true
+}
+
+func multipartEndpoint(path string) bool {
+	switch path {
+	case "/v1/images/edits", "/v1/audio/transcriptions", "/v1/audio/translations":
+		return true
+	}
+	return false
 }
 
 func (p *Proxy) readBody(w http.ResponseWriter, r *http.Request, st *reqState) ([]byte, int, error) {
