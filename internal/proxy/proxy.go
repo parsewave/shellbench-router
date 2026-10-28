@@ -118,7 +118,7 @@ func New(o Options) (*Proxy, error) {
 	}
 	p.rp = &httputil.ReverseProxy{
 		Rewrite:        p.rewrite,
-		Transport:      rt,
+		Transport:      &credentialTransport{base: rt, p: p},
 		ModifyResponse: p.modifyResponse,
 		ErrorHandler:   p.errorHandler,
 		BufferPool:     &bufPool{},
@@ -189,7 +189,7 @@ type reqState struct {
 	status      int
 	upstreamSt  int
 	upstreamID  string
-	upstreamKey string // pinned across request preparation and dispatch
+	upstreamKey string // pinned for search identity, dispatch and response scrubbing
 	retries     int
 	usage       usage
 	ttfb        time.Duration
@@ -529,6 +529,7 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 		st.upstreamKey = p.opt.Key.Get()
 	}
 	h.Set("Authorization", "Bearer "+st.upstreamKey)
+	h.Set("Accept-Encoding", "identity")
 	if p.opt.Organization != "" {
 		h.Set("OpenAI-Organization", p.opt.Organization)
 	}
@@ -550,14 +551,18 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	st := stateFrom(resp.Request.Context())
 	st.upstreamSt, st.status = resp.StatusCode, resp.StatusCode
 	st.ttfb = time.Since(st.start)
+	p.sanitizeHeaders(resp.Header, st)
+	p.sanitizeHeaders(resp.Trailer, st)
 	st.upstreamID = truncate(resp.Header.Get("X-Request-Id"), 128)
-	for _, h := range strippedResponseHeaders {
-		resp.Header.Del(h)
-	}
-	for k := range resp.Header {
-		if strings.HasPrefix(k, "X-Ratelimit-") {
-			delete(resp.Header, k)
-		}
+	// Trailers are populated only after the body has been consumed. The wrapper
+	// scrubs them again before ReverseProxy copies them to the client.
+	resp.Body = &credentialBody{ReadCloser: resp.Body, secret: []byte(st.upstreamKey), sanitize: func() { p.sanitizeHeaders(resp.Trailer, st) }}
+	if encoding := resp.Header.Get("Content-Encoding"); encoding != "" && encoding != "identity" {
+		// The transport requests uncompressed bytes. Do not relay a provider
+		// encoding that would hide a credential from the streaming filter.
+		st.err = "upstream_encoding_unsupported"
+		replaceWithError(resp, http.StatusBadGateway, "server_error", st.err, "The upstream provider returned an unsupported content encoding.")
+		resp.Header.Del("Content-Encoding")
 	}
 
 	switch {
@@ -616,7 +621,7 @@ func (p *Proxy) errorHandler(w http.ResponseWriter, r *http.Request, err error) 
 		p.fail(w, st, http.StatusGatewayTimeout, "server_error", "upstream_timeout", "The upstream provider stopped responding.")
 	default:
 		code := "upstream_unavailable"
-		p.log.Warn("upstream request failed", "request_id", st.id, "error", err.Error())
+		p.log.Warn("upstream request failed", "request_id", st.id, "error", string(p.scrubFor(st, []byte(err.Error()))))
 		st.err = code
 		p.fail(w, st, http.StatusBadGateway, "server_error", code, "The upstream provider could not be reached.")
 	}
@@ -650,7 +655,7 @@ func (p *Proxy) scrubErrorBody(resp *http.Response) {
 	if json.Valid(b) {
 		resp.Header.Set("Content-Type", "application/json")
 	}
-	setBody(resp, p.scrub(b))
+	setBody(resp, p.scrubFor(stateFrom(resp.Request.Context()), b))
 }
 
 func (p *Proxy) scrub(b []byte) []byte {
@@ -674,7 +679,7 @@ func (p *Proxy) rewriteModels(resp *http.Response, st *reqState) error {
 			return err
 		}
 	}
-	setBody(resp, p.scrub(b))
+	setBody(resp, p.scrubFor(st, b))
 	return nil
 }
 
