@@ -341,6 +341,16 @@ go test -run '^$' -bench . ./internal/proxy/           # in-process overhead ben
 PYTHON=/path/to/python-with-openai scripts/e2e.sh      # local smoke test, SDK test, load benchmarks
 ```
 
+Opt-in OpenAI proof makes billable requests. Inject `OPENAI_API_KEY` into the test process through your secret manager; do not put it in command arguments, fixtures, or output files.
+
+```bash
+SHELLBENCH_OPENAI_LIVE=1 go test ./internal/proxy -run '^(TestOpenAILive|TestSearchOpenAILive|TestDecisionsOpenAILive)$' -count=1 -v
+# Point this at the standalone native binary, not a shell/login wrapper:
+SHELLBENCH_OPENAI_LIVE=1 SHELLBENCH_CODEX_BIN=/path/to/codex go test ./internal/proxy -run '^TestNativeCodexOpenAILive$' -count=1 -v
+```
+
+The media proof requires actual hosted web-search citations, generated/edited images, speech, transcription, translation, and embeddings. The native fixture uses an empty home, a proxy token only, and HTTP/SSE (`supports_websockets=false`). Its provider name is `OpenAI`, as required by Codex's standalone-search capability gate; `features.standalone_web_search=true` enables that experimental path. It checks both Responses and standalone search traffic and a completed answer. The upstream key remains in the Go server process.
+
 To check a deployment with the OpenAI SDK:
 ```bash
 PROXY_BASE_URL=https://host/v1 PROXY_TOKEN=sk-px-… PROXY_TOKEN_RESTRICTED=sk-px-… \
