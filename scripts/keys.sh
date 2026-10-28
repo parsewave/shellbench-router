@@ -83,12 +83,25 @@ admin-key)
 			chmod 0444 secrets/admin_api_key
 		fi
 	fi
-	if ! grep -qE '^COMPOSE_FILE=.*deploy/docker-compose.admin.yml' .env; then
-		if grep -qE '^COMPOSE_FILE=' .env; then
-			sed -i.bak -E 's#^(COMPOSE_FILE=.*)$#\1:deploy/docker-compose.admin.yml#' .env && rm -f .env.bak
-		else
-			echo 'COMPOSE_FILE=docker-compose.yml:deploy/docker-compose.admin.yml' >>.env
-		fi
+	# Host networking must be last: it removes bridge port publications.
+	old_files=$(sed -n 's/^COMPOSE_FILE=//p' .env)
+	new_files="" host_file=""
+	IFS=: read -r -a files <<< "${old_files:-docker-compose.yml}"
+	for file in "${files[@]}"; do
+		case "$file" in
+		deploy/docker-compose.admin.yml) ;;
+		deploy/docker-compose.host.yml) host_file=":$file" ;;
+		*) new_files="${new_files:+$new_files:}$file" ;;
+		esac
+	done
+	new_files="$new_files:deploy/docker-compose.admin.yml$host_file"
+	if [ "$old_files" != "$new_files" ]; then
+		next=$(mktemp .env.XXXXXX)
+		while IFS= read -r line || [ -n "$line" ]; do
+			case "$line" in COMPOSE_FILE=*) ;; *) printf '%s\n' "$line" ;; esac
+		done < .env > "$next"
+		printf 'COMPOSE_FILE=%s\n' "$new_files" >> "$next"
+		mv "$next" .env
 		fresh=1
 	fi
 	if [ "$fresh" = 1 ]; then
@@ -98,7 +111,7 @@ admin-key)
 		echo "Admin key rotated; the proxy picks it up within seconds." >&2
 	fi
 	DOMAIN=$(grep -E '^PROXY_DOMAIN=' .env | cut -d= -f2-)
-	echo "Admin API: https://$DOMAIN/admin/clients  (Authorization: Bearer <key>)" >&2
+	echo "Local admin API: http://127.0.0.1:8081/admin/clients  (Authorization: Bearer <key>)" >&2
 	echo "The admin key is printed below exactly once; store it in a password manager." >&2
 	printf '%s\n' "$KEY"
 	KEY=""

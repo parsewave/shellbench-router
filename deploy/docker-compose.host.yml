@@ -11,8 +11,10 @@ services:
   proxy:
     network_mode: host
     expose: !reset []
+    ports: !reset []
     environment:
       LISTEN_ADDR: "127.0.0.1:8080"
+      ADMIN_LISTEN_ADDR: "127.0.0.1:8081"
   caddy:
     network_mode: host
     ports: !reset []

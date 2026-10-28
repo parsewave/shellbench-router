@@ -140,7 +140,7 @@ else
 fi
 
 # --- admin API key ---------------------------------------------------------
-# Lets the operator manage tokens over HTTPS (pxadmin / curl) instead of SSH.
+# Local-only token administration; remote operators use an SSH tunnel.
 ADMIN_KEY=""
 if [ "$ADMIN" = 1 ]; then
 	if [ -e secrets/admin_api_key ]; then
@@ -159,8 +159,8 @@ fi
 
 # --- .env ------------------------------------------------------------------
 COMPOSE_FILES="docker-compose.yml:deploy/docker-compose.keyfile.yml"
-[ "$HOST_NET" = 1 ] && COMPOSE_FILES="$COMPOSE_FILES:deploy/docker-compose.host.yml"
 [ "$ADMIN" = 1 ] && COMPOSE_FILES="$COMPOSE_FILES:deploy/docker-compose.admin.yml"
+[ "$HOST_NET" = 1 ] && COMPOSE_FILES="$COMPOSE_FILES:deploy/docker-compose.host.yml"
 (
 	umask 077
 	cat >.env <<EOF
@@ -225,9 +225,11 @@ Admin key (shown once; put it in your password manager):
 
   $ADMIN_KEY
 
-Manage tokens from your own machine:
+Manage tokens on the server, or open an SSH tunnel from your own machine:
   pip install "pxclient @ git+https://github.com/parsewave/shellbench-router.git#subdirectory=clients/python"
-  export PX_ADMIN_URL=https://$DOMAIN PX_ADMIN_KEY=<the key above>
+  ssh -N -L 127.0.0.1:8081:127.0.0.1:8081 <ssh-user>@$DOMAIN
+  export PX_PUBLIC_URL=https://$DOMAIN/v1
+  export PX_ADMIN_URL=http://127.0.0.1:8081 PX_ADMIN_KEY=<the key above>
   pxadmin add alice --allow-ips <their IP>
 EOF
 	ADMIN_KEY=""

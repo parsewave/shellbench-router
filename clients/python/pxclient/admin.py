@@ -1,6 +1,8 @@
 """pxadmin: manage gateway tokens from your own machine via the admin API.
 
-    export PX_ADMIN_URL=https://llm.example.com PX_ADMIN_KEY=sk-pxadmin-...
+    # Use SSH forwarding when administering from your own machine.
+    export PX_PUBLIC_URL=https://llm.example.com/v1
+    export PX_ADMIN_URL=http://127.0.0.1:8081 PX_ADMIN_KEY=sk-pxadmin-...
 
     pxadmin add alice --allow-ips 203.0.113.7 --models gpt-4o-mini --expires 90d
     pxadmin list

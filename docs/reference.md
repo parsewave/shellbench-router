@@ -44,7 +44,7 @@ scripts/setup.sh --provider openrouter --domain auto \
 `setup.sh` does the following:
 1. Stores the upstream key in `secrets/upstream_api_key`, never in `.env`. The file is owner-only, owned by the container's uid 65532 (mode 0400).
 2. Writes `.env` with the provider's base URL and `COMPOSE_FILE`, so plain `docker compose …` picks up the key-file override.
-3. Creates the admin API key in `secrets/admin_api_key` (same protection) and enables `/admin/`. Skip this with `--no-admin`.
+3. Creates the admin API key in `secrets/admin_api_key` (same protection) and enables a host-only admin listener on port 8081. Skip this with `--no-admin`.
 4. Runs `docker compose up -d --build` and waits for the proxy to report healthy.
 5. Optionally creates the first client token and prints it **once**.
 6. Checks `https://<host>/healthz` end to end, and `GET /v1/models` too when the first client has no IP allowlist.
@@ -113,16 +113,16 @@ TOKEN=$(scripts/keys.sh add -id carol)    # only the token goes to stdout
 
 ### Admin API (HTTP)
 
-The same operations are available over HTTPS, so tokens can be managed without SSH. `pxadmin` (see the [README](../README.md)) wraps it; the raw endpoints are below. `setup.sh` enables it. On older deployments, or to rotate the key:
+The same operations are available on a separate private HTTP listener. The public API and Caddy never serve `/admin/`, even with a valid admin key. On the server use `http://127.0.0.1:8081`; remote operators must use an SSH tunnel (see README). `pxadmin` (see the [README](../README.md)) wraps it; the raw endpoints are below. `setup.sh` enables it. On older deployments, or to rotate the key:
 
 ```bash
 scripts/keys.sh admin-key      # prints the admin key once; rerun to rotate it (no restart)
 ```
 
-This writes `secrets/admin_api_key` (owner-only, like the upstream key), adds `deploy/docker-compose.admin.yml` to `COMPOSE_FILE`, and recreates the proxy. Without an admin key, `/admin/` answers 404.
+This writes `secrets/admin_api_key` (owner-only, like the upstream key), adds `deploy/docker-compose.admin.yml` to `COMPOSE_FILE`, and recreates the proxy. Without an admin key, no admin listener is started. Existing remote-admin users must switch to SSH forwarding when updating and set `PX_PUBLIC_URL=https://<public-host>/v1` for token handoffs. For existing host-network deployments, rerun `scripts/keys.sh admin-key` once: it rotates the admin key and moves the host override after the admin override in `COMPOSE_FILE`. Custom Compose stacks must use this same ordering.
 
 ```bash
-A="Authorization: Bearer $ADMIN_KEY"; B=https://llm.example.com
+A="Authorization: Bearer $ADMIN_KEY"; B=http://127.0.0.1:8081
 
 curl -H "$A" $B/admin/clients                                                     # list (never shows tokens)
 curl -H "$A" $B/admin/clients -d '{"id":"alice","allowed_ips":["198.51.100.24"],"models":["gpt-4o-mini","o3*"],"rpm":600,"max_concurrent":32,"expires":"90d"}'
@@ -210,6 +210,7 @@ All configuration is through environment variables (`.env`). See `.env.example`.
 | `ACCESS_LOG_FILE` | — | Optional JSONL access log. Put it on its own rotated volume. |
 | `SHUTDOWN_TIMEOUT` | 30s | Grace period for in-flight requests on SIGTERM |
 | `ADMIN_API_KEY_FILE` / `ADMIN_API_KEY` | — | Enables the admin API at `/admin/` (set up by `scripts/keys.sh admin-key`). File form is hot-reloaded. |
+| `ADMIN_LISTEN_ADDR` | `127.0.0.1:8081` | Separate admin listener. Docker binds container `:8081` and publishes only host `127.0.0.1:8081`; host networking binds loopback directly. Never open port 8081 in a firewall/security group. |
 | `TRUSTED_PROXIES` | loopback + private ranges | Peers whose `X-Forwarded-For` is used as the client IP for allowlists (Caddy). Never expose the proxy port itself. |
 
 Default routes: `POST /v1/responses`, `POST /v1/responses/compact`, `POST /v1/responses/input_tokens`, `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/embeddings`, `POST /v1/audio/speech`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `POST /v1/images/generations`, `POST /v1/images/edits`, `POST /v1/moderations`, `POST /v1/messages`, `POST /v1/messages/count_tokens` (Anthropic Messages API, for Claude Code), `GET /v1/models`, `GET /v1/models/*`, `GET|DELETE /v1/responses/*`, `POST /v1/responses/*/cancel`, `GET /v1/responses/*/input_items`. These are model calls and model listing; nothing that stores files or data on the provider account (files, uploads, batches, vector stores, conversations) or manages it (organization, projects, fine-tuning) is forwarded. Any other path returns 404 without contacting the upstream, logged as a warning with `"error":"unknown_url"` and the path, so `docker compose logs proxy | grep unknown_url` shows what clients asked for. Clients always call `/v1/...`; the gateway maps that onto the upstream base path (e.g. OpenRouter's `/api/v1`).
@@ -255,11 +256,11 @@ One structured record per request goes to stdout, and optionally to a JSONL file
 
 * **The upstream key stays on the server.** It lives only in the proxy container, as a mounted file or env var. It isn't in the image (`.dockerignore` excludes `.env`, `secrets/`, `config/`), isn't in Caddy, and isn't in logs, which show only a 4-byte SHA-256 fingerprint. It never appears in responses: `OpenAI-Organization`, `OpenAI-Project`, `Set-Cookie` and `x-ratelimit-*` headers are stripped (the last reveal the provider's tier and the combined usage of all clients), and error bodies and `/v1/models` are scrubbed.
 * **Client credentials never go upstream.** Request headers are forwarded by allow-list only: `Content-Type`, `Accept`, `User-Agent`, `OpenAI-Beta`, `X-Client-Request-Id`, `X-Stainless-*`. `Authorization`, cookies, `X-Forwarded-*`, client org/project headers and request trailers are dropped, so client IPs are not sent upstream. Query strings are forwarded only on GET/DELETE.
-* **Authentication** hashes the presented token and compares it against every stored hash with `crypto/subtle`, with no early exit. Every failure kind returns the same 401. There's no admin API; management happens through the CLI on the host.
+* **Authentication** hashes the presented token and compares it against every stored hash with `crypto/subtle`, with no early exit. Every failure kind returns the same 401. The admin API uses its own key and private listener; management also works through the CLI on the host.
 * **Model enforcement** uses an exact-key JSON scanner instead of `encoding/json` struct decoding, which matches keys case-insensitively. That closes parser-differential bypasses such as `{"model":"o3","MODEL":"gpt-4o"}`. Duplicate `model` keys, escaped keys, invalid JSON, and multiple or malformed `Content-Type` headers are all handled. Restricted tokens may also use configured image-edit and audio-transcription/translation multipart routes. Inspection requires one non-file, unencoded `model` field and unambiguous part dispositions. Duplicate or oversized model fields are rejected. File bytes, boundaries, and repeated SDK fields are forwarded unchanged, without temporary files. Other restricted requests require JSON. The scanner is fuzz-tested against a reference decoder.
 * **Not an open proxy.** The upstream host is fixed by configuration. Only allow-listed method+path pairs are forwarded. Percent-encoded slashes, empty segments and dot segments are rejected, not normalized.
 * **Resource limits.** Bodies are bounded per request and globally, with the budget reserved before reading, so stalled uploads cannot exhaust memory. A client that stops reading a stream is disconnected at `STREAM_IDLE_TIMEOUT`, which frees its slot.
-* **Container hardening:** distroless static image, uid 65532, read-only rootfs, `cap_drop: ALL`, `no-new-privileges`. Only Caddy publishes ports.
+* **Container hardening:** distroless static image, uid 65532, read-only rootfs, `cap_drop: ALL`, `no-new-privileges`. Only Caddy publishes public ports; the optional admin port is published on host loopback only.
 
 ## 9. Test and benchmark results
 

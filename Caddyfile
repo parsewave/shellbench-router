@@ -10,9 +10,8 @@
 		max_size 64MB
 	}
 
-	# /admin/* is the token admin API; the proxy answers 404 unless an
-	# admin key is configured (scripts/keys.sh admin-key).
-	@api path /v1/* /healthz /admin/*
+	# Administration is host-only on a separate listener, never this ingress.
+	@api path /v1/* /healthz
 	handle @api {
 		# PROXY_UPSTREAM is 127.0.0.1:8080 with deploy/docker-compose.host.yml.
 		reverse_proxy {$PROXY_UPSTREAM:proxy:8080} {

@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"oaiproxy/internal/tokens"
@@ -43,7 +44,8 @@ type Server struct {
 	Log        *slog.Logger // audit log of every admin call
 	Now        func() time.Time
 
-	mux *http.ServeMux
+	mux  *http.ServeMux
+	once sync.Once
 }
 
 const maxBody = 64 << 10
@@ -74,7 +76,7 @@ func (s *Server) init() {
 func (s *Server) Enabled() bool { return s.Key != nil && s.Key.Get() != "" }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.init()
+	s.once.Do(s.init)
 	w.Header().Set("Cache-Control", "no-store")
 	if !s.Enabled() {
 		writeError(w, http.StatusNotFound, "unknown_url", "Not found.")

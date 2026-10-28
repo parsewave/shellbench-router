@@ -4,9 +4,9 @@
 
 ```bash
 pip install "pxclient @ git+https://github.com/parsewave/shellbench-router.git#subdirectory=clients/python"
-export PX_ADMIN_URL=https://llm.example.com PX_ADMIN_KEY=sk-pxadmin-...   # or PX_ADMIN_KEY_FILE
-# When admin is reached through a private listener or SSH tunnel:
+ssh -N -L 127.0.0.1:8081:127.0.0.1:8081 <ssh-user>@llm.example.com
 export PX_PUBLIC_URL=https://llm.example.com/v1
+export PX_ADMIN_URL=http://127.0.0.1:8081 PX_ADMIN_KEY=sk-pxadmin-...   # or PX_ADMIN_KEY_FILE
 pxadmin add alice --allow-ips 203.0.113.7 --models gpt-4o-mini --expires 90d
 pxadmin list
 ```
