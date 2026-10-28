@@ -176,24 +176,25 @@ func (p *Proxy) Handler() http.Handler {
 type ctxKey struct{}
 
 type reqState struct {
-	id         string
-	start      time.Time
-	method     string
-	path       string
-	client     string
-	principal  *tokens.Principal
-	clientIP   netip.Addr
-	route      string
-	model      string
-	stream     bool
-	status     int
-	upstreamSt int
-	upstreamID string
-	retries    int
-	usage      usage
-	ttfb       time.Duration
-	latency    time.Duration
-	err        string
+	id          string
+	start       time.Time
+	method      string
+	path        string
+	client      string
+	principal   *tokens.Principal
+	clientIP    netip.Addr
+	route       string
+	model       string
+	stream      bool
+	status      int
+	upstreamSt  int
+	upstreamID  string
+	upstreamKey string // pinned across request preparation and dispatch
+	retries     int
+	usage       usage
+	ttfb        time.Duration
+	latency     time.Duration
+	err         string
 
 	clientCtx       context.Context
 	ctx             context.Context
@@ -358,7 +359,11 @@ func (p *Proxy) prepareBody(w http.ResponseWriter, r *http.Request, st *reqState
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
 	r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
-	if len(body) == 0 {
+	if r.URL.Path == "/v1/alpha/search" && mt != "" && mt != "application/json" {
+		p.fail(w, st, http.StatusBadRequest, "invalid_request_error", "invalid_content_type", "Standalone search requires a JSON request body.")
+		return false
+	}
+	if len(body) == 0 && r.URL.Path != "/v1/alpha/search" {
 		r.Body = http.NoBody
 		return true
 	}
@@ -394,6 +399,32 @@ func (p *Proxy) prepareBody(w http.ResponseWriter, r *http.Request, st *reqState
 			p.fail(w, st, http.StatusForbidden, "invalid_request_error", "model_not_allowed", fmt.Sprintf("This proxy token is not permitted to use model `%s`.", truncate(info.model, 128)))
 			return false
 		}
+	}
+	if r.URL.Path == "/v1/alpha/search" {
+		if !info.hasModel {
+			p.fail(w, st, http.StatusBadRequest, "invalid_request_error", "model_required", "Standalone search requires an explicit model.")
+			return false
+		}
+		st.upstreamKey = p.opt.Key.Get()
+		body, err = scopedSearch(body, pr.ID, p.opt.Upstream.String(), p.opt.Organization, p.opt.Project, st.upstreamKey)
+		if err != nil {
+			p.fail(w, st, http.StatusBadRequest, "invalid_request_error", "invalid_search_request", err.Error())
+			return false
+		}
+		if int64(len(body)) > p.opt.MaxRequestBytes {
+			p.fail(w, st, http.StatusRequestEntityTooLarge, "invalid_request_error", "request_too_large", "Scoped search request exceeds the body limit.")
+			return false
+		}
+		delta := int64(len(body)) - st.bodyReserved
+		if p.buffered.Add(delta) > p.opt.MaxBufferedBytes {
+			p.buffered.Add(-delta)
+			p.fail(w, st, http.StatusServiceUnavailable, "server_error", "proxy_overloaded", "The proxy is at capacity; retry shortly.")
+			return false
+		}
+		st.bodyReserved = int64(len(body))
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
 	}
 	return true
 }
@@ -493,7 +524,11 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 			h[k] = vv
 		}
 	}
-	h.Set("Authorization", "Bearer "+p.opt.Key.Get())
+	st := stateFrom(in.Context())
+	if st.upstreamKey == "" {
+		st.upstreamKey = p.opt.Key.Get()
+	}
+	h.Set("Authorization", "Bearer "+st.upstreamKey)
 	if p.opt.Organization != "" {
 		h.Set("OpenAI-Organization", p.opt.Organization)
 	}
