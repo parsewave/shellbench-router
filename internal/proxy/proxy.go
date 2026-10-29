@@ -258,6 +258,13 @@ func (p *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Only explicitly configured endpoints are forwarded.
+	// Codex treats 426 during WebSocket negotiation as an immediate HTTP
+	// fallback. Keep authentication and the configured Responses route in force.
+	if r.Method == http.MethodGet && r.URL.Path == "/v1/responses" && websocketUpgrade(r) && matchRoute(p.routes, http.MethodPost, r.URL) != nil {
+		st.route = "GET /v1/responses"
+		p.fail(w, st, http.StatusUpgradeRequired, "invalid_request_error", "websocket_unsupported", "WebSocket transport is unavailable. Retry POST /v1/responses using HTTP streaming.")
+		return
+	}
 	route := matchRoute(p.routes, r.Method, r.URL)
 	if route == nil {
 		p.fail(w, st, http.StatusNotFound, "invalid_request_error", "unknown_url", fmt.Sprintf("Unsupported endpoint: %s %s", r.Method, st.path))

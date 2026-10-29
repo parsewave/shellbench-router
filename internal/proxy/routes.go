@@ -2,9 +2,24 @@ package proxy
 
 import (
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 )
+
+func websocketUpgrade(r *http.Request) bool {
+	if !strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket") {
+		return false
+	}
+	for _, value := range r.Header.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "upgrade") {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // Route is one explicitly allowed upstream endpoint, e.g. "POST /v1/chat/completions".
 // A `*` segment matches exactly one non-empty, safe path segment.

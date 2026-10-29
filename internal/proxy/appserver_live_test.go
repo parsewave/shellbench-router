@@ -20,6 +20,15 @@ import (
 // Exercise the app's native engine in a disposable home. Only the proxy token
 // reaches the child; the provider key belongs exclusively to the Go server.
 func TestCodexAppServerOpenAILive(t *testing.T) {
+	testCodexAppServerOpenAILive(t, false)
+}
+
+func TestCodexAppServerWebSocketFallbackOpenAILive(t *testing.T) {
+	testCodexAppServerOpenAILive(t, true)
+}
+
+func testCodexAppServerOpenAILive(t *testing.T, websockets bool) {
+	t.Helper()
 	if os.Getenv("SHELLBENCH_OPENAI_LIVE") != "1" || os.Getenv("SHELLBENCH_CODEX_BIN") == "" {
 		t.Skip("opt-in app-server proof requires SHELLBENCH_CODEX_BIN")
 	}
@@ -43,7 +52,7 @@ func TestCodexAppServerOpenAILive(t *testing.T) {
 		`model_providers.gateway.auth.args=["SHELLBENCH_PROXY_TOKEN"]`,
 		`model_providers.gateway.wire_api="responses"`,
 		`model_providers.gateway.requires_openai_auth=false`,
-		`model_providers.gateway.supports_websockets=false`,
+		`model_providers.gateway.supports_websockets=` + strconv.FormatBool(websockets),
 		`web_search="disabled"`, `model_reasoning_effort="low"`,
 		`shell_environment_policy.inherit="none"`,
 	} {
@@ -197,8 +206,10 @@ func TestCodexAppServerOpenAILive(t *testing.T) {
 	e.srv.CloseClientConnections()
 	e.srv.Close()
 	paths := map[string]int{}
+	fallbacks := 0
 	for _, line := range strings.Split(e.access.String(), "\n") {
 		var rec struct {
+			Method string
 			Path   string
 			Status int
 			Error  string
@@ -206,14 +217,21 @@ func TestCodexAppServerOpenAILive(t *testing.T) {
 		if json.Unmarshal([]byte(line), &rec) != nil {
 			continue
 		}
+		if rec.Method == "GET" && rec.Path == "/v1/responses" && rec.Status == 426 && rec.Error == "websocket_unsupported" {
+			fallbacks++
+			continue
+		}
 		// The native client closes SSE after its completion event, before EOF.
 		if rec.Status != 200 || (rec.Error != "" && !(rec.Path == "/v1/responses" && rec.Error == "client_disconnected")) {
 			t.Fatalf("app-server request %s status %d code %s", rec.Path, rec.Status, rec.Error)
 		}
-		paths[rec.Path]++
+		paths[rec.Method+" "+rec.Path]++
 	}
-	if paths["/v1/models"] == 0 || paths["/v1/responses"] == 0 {
+	if paths["GET /v1/models"] == 0 || paths["POST /v1/responses"] == 0 {
 		t.Fatal("app-server did not discover models and complete Responses through the gateway")
 	}
-	t.Logf("native catalog: %d models; app-server turn completed; provider key confined to server", len(models.Data))
+	if (fallbacks > 0) != websockets {
+		t.Fatalf("WebSocket fallback requests: %d; WebSockets enabled: %t", fallbacks, websockets)
+	}
+	t.Logf("native catalog: %d models; WebSocket fallbacks: %d; app-server turn completed; provider key confined to server", len(models.Data), fallbacks)
 }
