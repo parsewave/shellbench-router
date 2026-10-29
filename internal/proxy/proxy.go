@@ -588,6 +588,9 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	st.ttfb = time.Since(st.start)
 	p.sanitizeHeaders(resp.Header, st)
 	p.sanitizeHeaders(resp.Trailer, st)
+	if isModelDiscovery(st.route) {
+		resp.Header.Set("Cache-Control", "private, no-store")
+	}
 	st.upstreamID = truncate(resp.Header.Get("X-Request-Id"), 128)
 	// Trailers are populated only after the body has been consumed. The wrapper
 	// scrubs them again before ReverseProxy copies them to the client.
@@ -613,7 +616,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	case resp.StatusCode >= 400:
 		p.scrubErrorBody(resp)
 	case resp.StatusCode/100 == 2:
-		if st.route == "GET /v1/models" || st.route == "GET /v1/models/*" {
+		if isModelDiscovery(st.route) {
 			// Small responses: buffer, hide disallowed models, and mask
 			// account ids in owned_by.
 			return p.rewriteModels(resp, st)
@@ -703,6 +706,10 @@ func (p *Proxy) scrub(b []byte) []byte {
 	return reUser.ReplaceAll(b, []byte("user-***"))
 }
 
+func isModelDiscovery(route string) bool {
+	return route == "GET /v1/models" || route == "GET /v1/models/*"
+}
+
 func (p *Proxy) rewriteModels(resp *http.Response, st *reqState) error {
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 	resp.Body.Close()
@@ -720,7 +727,7 @@ func (p *Proxy) rewriteModels(resp *http.Response, st *reqState) error {
 		if err := json.Unmarshal(b, &model); err != nil {
 			return fmt.Errorf("decode model detail: %w", err)
 		}
-		if !tokens.ModelEligible(model.ID) {
+		if !st.principal.AllowsModel(model.ID) {
 			st.err, st.status = "model_not_found", http.StatusNotFound
 			replaceWithError(resp, http.StatusNotFound, "invalid_request_error", "model_not_found", "The requested model is excluded by the proxy.")
 			return nil
