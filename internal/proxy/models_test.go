@@ -235,6 +235,33 @@ func TestResolvedModelDetailUsesClientAllowlist(t *testing.T) {
 	}
 }
 
+func TestModelDiscoveryUsesExactJSONID(t *testing.T) {
+	for _, raw := range []string{
+		`{"id":"gpt-5.6-cyber","ID":"gpt-4o"}`,
+		`{"id":"gpt-4o-mini","Id":"gpt-4o"}`,
+		`{"ID":"gpt-4o"}`,
+	} {
+		e := newEnv(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v1/models" {
+				io.WriteString(w, `{"data":[`+raw+`]}`)
+			} else {
+				io.WriteString(w, raw)
+			}
+		}), nil)
+		resp, b := e.do("GET", "/v1/models", e.tok["alice"], "")
+		var doc struct {
+			Data []json.RawMessage `json:"data"`
+		}
+		if resp.StatusCode != 200 || json.Unmarshal(b, &doc) != nil || len(doc.Data) != 0 {
+			t.Errorf("catalog accepted a case-insensitive ID: %d %s", resp.StatusCode, b)
+		}
+		resp, b = e.do("GET", "/v1/models/gpt-4o", e.tok["alice"], "")
+		if resp.StatusCode != 404 {
+			t.Errorf("detail accepted a case-insensitive ID: %d %s", resp.StatusCode, b)
+		}
+	}
+}
+
 func TestModelDiscoveryCannotCacheSharedRepresentations(t *testing.T) {
 	for _, status := range []int{200, 404} {
 		e := newEnv(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

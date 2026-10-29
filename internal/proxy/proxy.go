@@ -752,13 +752,11 @@ func (p *Proxy) rewriteModels(resp *http.Response, st *reqState) error {
 			return err
 		}
 	} else {
-		var model struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(b, &model); err != nil {
+		id, err := discoveryModelID(b)
+		if err != nil {
 			return fmt.Errorf("decode model detail: %w", err)
 		}
-		if !st.principal.AllowsModel(model.ID) {
+		if !st.principal.AllowsModel(id) {
 			st.err, st.status = "model_not_found", http.StatusNotFound
 			replaceWithError(resp, http.StatusNotFound, "invalid_request_error", "model_not_found", "The requested model is excluded by the proxy.")
 			return nil
@@ -780,15 +778,27 @@ func filterModels(b []byte, pr *tokens.Principal) ([]byte, error) {
 	}
 	kept := make([]json.RawMessage, 0, len(data))
 	for _, m := range data {
-		var id struct {
-			ID string `json:"id"`
-		}
-		if json.Unmarshal(m, &id) == nil && pr.AllowsModel(id.ID) {
+		if id, err := discoveryModelID(m); err == nil && pr.AllowsModel(id) {
 			kept = append(kept, m)
 		}
 	}
 	doc["data"], _ = json.Marshal(kept)
 	return json.Marshal(doc)
+}
+
+// Provider JSON names are exact. Go structs also match ID/Id, which can make
+// policy evaluate a different identifier from the public API's canonical id.
+func discoveryModelID(b []byte) (string, error) {
+	var model map[string]json.RawMessage
+	if err := json.Unmarshal(b, &model); err != nil {
+		return "", err
+	}
+	var id string
+	if raw, ok := model["id"]; ok {
+		err := json.Unmarshal(raw, &id)
+		return id, err
+	}
+	return id, nil
 }
 
 func replaceWithError(resp *http.Response, status int, typ, code, msg string) {
