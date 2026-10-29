@@ -27,15 +27,16 @@ func filterCodexCatalog(b []byte, pr *tokens.Principal) ([]byte, error) {
 	kept := make([]json.RawMessage, 0, len(models))
 	seen := make(map[string]bool, len(models))
 	for _, raw := range models {
-		var model struct {
-			Slug           string `json:"slug"`
-			SupportedInAPI bool   `json:"supported_in_api"`
-		}
-		if json.Unmarshal(raw, &model) != nil || strings.TrimSpace(model.Slug) == "" || seen[model.Slug] {
+		// JSON selectors are case-sensitive in Codex's serde contract. A Go
+		// struct would also match "Slug", potentially filtering a different ID.
+		var model map[string]json.RawMessage
+		var slug string
+		var supported bool
+		if json.Unmarshal(raw, &model) != nil || json.Unmarshal(model["slug"], &slug) != nil || json.Unmarshal(model["supported_in_api"], &supported) != nil || strings.TrimSpace(slug) == "" || seen[slug] {
 			return nil, errors.New("invalid native model catalog entry")
 		}
-		seen[model.Slug] = true
-		if model.SupportedInAPI && pr.AllowsModel(model.Slug) {
+		seen[slug] = true
+		if supported && pr.AllowsModel(slug) {
 			kept = append(kept, raw)
 		}
 	}

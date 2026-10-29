@@ -33,7 +33,7 @@ func TestCodexCatalogUsesProviderMetadataAndClientPolicy(t *testing.T) {
 						t.Errorf("catalog forwarded %s", h)
 					}
 				}
-				return catalogResponse(r, `{"models":[{"slug":"gpt-4o","supported_in_api":true,"base_instructions":"preserve beta/test wording","extra":{"untouched":true}},{"slug":"gpt-image-1-mini","supported_in_api":true},{"slug":"gpt-4","supported_in_api":true},{"slug":"gpt-5.6-cyber","supported_in_api":true},{"slug":"gpt-4o-alpha","supported_in_api":true},{"slug":"internal-only","supported_in_api":false}],"metadata":"preserved"}`), nil
+				return catalogResponse(r, `{"models":[{"slug":"gpt-4o","supported_in_api":true,"base_instructions":"preserve beta/test wording","extra":{"untouched":true}},{"slug":"gpt-image-1-mini","supported_in_api":true},{"slug":"gpt-4","supported_in_api":true},{"slug":"gpt-5.6-cyber","Slug":"gpt-4o","supported_in_api":true},{"slug":"gpt-4o-alpha","supported_in_api":true},{"slug":"internal-only","supported_in_api":false,"Supported_In_Api":true}],"metadata":"preserved"}`), nil
 			})
 		})
 		resp, b := e.do("GET", "/v1/models?client_version=0.165.0", e.tok[tc.client], "", "Cookie", "fixture", "ChatGPT-Account-ID", "fixture", "X-Codex-Turn-State", "fixture")
@@ -102,7 +102,7 @@ func TestCodexCatalogOriginIsExact(t *testing.T) {
 
 func TestMalformedCodexCatalogFailsClosed(t *testing.T) {
 	for _, body := range []string{
-		`{"data":[]}`, `{"models":null}`, `{"models":[{}]}`, `{"models":[{"slug":123}]}`,
+		`{"data":[]}`, `{"models":null}`, `{"models":[{}]}`, `{"models":[{"slug":123}]}`, `{"models":[{"Slug":"gpt-4o","supported_in_api":true}]}`,
 		`{"models":[{"slug":"gpt-4o","supported_in_api":true},{"slug":"gpt-4o","supported_in_api":true}]}`,
 		`{"models":[]}` + strings.Repeat(" ", 1<<20),
 	} {
