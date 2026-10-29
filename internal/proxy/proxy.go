@@ -200,6 +200,7 @@ type reqState struct {
 	ctx             context.Context
 	cancel          context.CancelCauseFunc
 	upstreamReadErr bool
+	nativeCatalog   bool // Codex metadata, selected by its client_version query
 	bodyReserved    int64
 	rc              *http.ResponseController
 	disarm          func()
@@ -274,6 +275,13 @@ func (p *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 				p.fail(w, st, http.StatusForbidden, "invalid_request_error", "model_not_allowed", "This proxy token is not permitted to use the requested model.")
 				return
 			}
+		}
+		if versions, present := query["client_version"]; present && st.route == "GET /v1/models" {
+			if len(versions) != 1 || !codexClientVersion.MatchString(versions[0]) {
+				p.fail(w, st, http.StatusBadRequest, "invalid_request_error", "invalid_query", "client_version must be a single MAJOR.MINOR.PATCH version.")
+				return
+			}
+			st.nativeCatalog = true
 		}
 	}
 
@@ -560,19 +568,30 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 		}
 	}
 	st := stateFrom(in.Context())
+	openAICatalog := st.nativeCatalog && openAICatalogUpstream(u)
+	// OpenAI serves Codex metadata on its Codex backend. Only its exact public
+	// API configuration may send the provider key there; custom providers stay
+	// on their configured origin and no caller or operator headers cross over.
+	if openAICatalog {
+		pr.Out.URL = &url.URL{Scheme: "https", Host: "chatgpt.com", Path: "/backend-api/codex/models", RawQuery: url.Values{"client_version": {in.URL.Query().Get("client_version")}}.Encode()}
+		h = make(http.Header)
+		h.Set("Accept", "application/json")
+	}
 	if st.upstreamKey == "" {
 		st.upstreamKey = p.opt.Key.Get()
 	}
 	h.Set("Authorization", "Bearer "+st.upstreamKey)
 	h.Set("Accept-Encoding", "identity")
-	if p.opt.Organization != "" {
-		h.Set("OpenAI-Organization", p.opt.Organization)
-	}
-	if p.opt.Project != "" {
-		h.Set("OpenAI-Project", p.opt.Project)
-	}
-	for k, vv := range p.opt.ExtraHeaders {
-		h[k] = vv
+	if !openAICatalog {
+		if p.opt.Organization != "" {
+			h.Set("OpenAI-Organization", p.opt.Organization)
+		}
+		if p.opt.Project != "" {
+			h.Set("OpenAI-Project", p.opt.Project)
+		}
+		for k, vv := range p.opt.ExtraHeaders {
+			h[k] = vv
+		}
 	}
 	pr.Out.Header = h
 }
@@ -711,12 +730,24 @@ func isModelDiscovery(route string) bool {
 }
 
 func (p *Proxy) rewriteModels(resp *http.Response, st *reqState) error {
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	limit := int64(16 << 20)
+	if st.nativeCatalog {
+		limit = 1 << 20 // Codex's native catalog contract caps responses at 1 MiB.
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	resp.Body.Close()
 	if err != nil {
 		return err
 	}
-	if st.route == "GET /v1/models" {
+	if int64(len(b)) > limit {
+		return errors.New("model catalog exceeds response limit")
+	}
+	if st.nativeCatalog {
+		b, err = filterCodexCatalog(b, st.principal)
+		if err != nil {
+			return err
+		}
+	} else if st.route == "GET /v1/models" {
 		if b, err = filterModels(b, st.principal); err != nil {
 			return err
 		}

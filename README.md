@@ -76,6 +76,24 @@ client = OpenAI(base_url="https://203-0-113-7.sslip.io/v1", api_key="sk-px-...")
 print(client.responses.create(model="gpt-4o-mini", input="hi").output_text)
 ```
 
+**Codex CLI and app:** select a named provider in `~/.codex/config.toml`. Keep the first two settings before any TOML table:
+
+```toml
+model_provider = "gateway"
+model = "gpt-6.1-sol"
+
+[model_providers.gateway]
+name = "Gateway"
+base_url = "https://203-0-113-7.sslip.io/v1"
+wire_api = "responses"
+env_key = "SHELLBENCH_PROXY_TOKEN"
+model_catalog_url = "https://203-0-113-7.sslip.io/v1/models"
+requires_openai_auth = false
+supports_websockets = false
+```
+
+Set `SHELLBENCH_PROXY_TOKEN` to the user's proxy token in the client's environment, or replace `env_key` with a [credential helper](https://learn.chatgpt.com/docs/enterprise/connect-to-a-gateway). Command-backed authentication also discovers models automatically. The upstream OpenAI key stays on the server. See [native model discovery](docs/reference.md#codex-model-discovery) for provider requirements.
+
 **Claude Code and Anthropic SDKs** use the same token. The gateway also speaks Anthropic's Messages API (`/v1/messages`), so it works as long as the provider does (OpenRouter does, for every model). Note there's no `/v1` in this URL:
 
 ```bash
