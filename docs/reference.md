@@ -356,8 +356,8 @@ Opt-in OpenAI proof makes billable requests. Inject `OPENAI_API_KEY` into the te
 SHELLBENCH_OPENAI_LIVE=1 go test ./internal/proxy -run '^(TestOpenAILive|TestSearchOpenAILive|TestDecisionsOpenAILive)$' -count=1 -v
 # Point this at the standalone native binary, not a shell/login wrapper:
 SHELLBENCH_OPENAI_LIVE=1 SHELLBENCH_CODEX_BIN=/path/to/codex go test ./internal/proxy -run '^TestNativeCodexOpenAILive$' -count=1 -v
-# Point this at the app's bundled native binary to verify model discovery and a turn:
-SHELLBENCH_OPENAI_LIVE=1 SHELLBENCH_CODEX_BIN=/path/to/app-bundled/codex go test ./internal/proxy -run '^TestCodexAppServerOpenAILive$' -count=1 -v
+# Point this at the app's bundled native binary to verify HTTP and WebSocket fallback:
+SHELLBENCH_OPENAI_LIVE=1 SHELLBENCH_CODEX_BIN=/path/to/app-bundled/codex go test ./internal/proxy -run '^TestCodexAppServer(WebSocketFallback)?OpenAILive$' -count=1 -v
 ```
 
 The media proof requires actual hosted web-search citations, generated/edited images, speech, transcription, translation, and embeddings. The native fixture uses an empty home, a proxy token only, and HTTP/SSE (`supports_websockets=false`). Its provider name is `OpenAI`, as required by Codex's standalone-search capability gate; `features.standalone_web_search=true` enables that experimental path. It checks both Responses and standalone search traffic and a completed answer. The upstream key remains in the Go server process.
@@ -387,7 +387,7 @@ Live proof (billable, key injected through `OPENAI_API_KEY`): `SHELLBENCH_OPENAI
 * **Rate limits count requests, not tokens.** Limiter state is in memory and per instance, so several replicas multiply the effective limits.
 * **Multipart media uploads** support restricted tokens for image edits and audio transcription/translation. Account-wide file uploads remain excluded. Per-request and global body limits still apply.
 * **Chat Completions stream usage is logged only if the client sends `stream_options: {"include_usage": true}`.**
-* **WebSocket/Realtime endpoints aren't supported.**
+* **WebSocket/Realtime endpoints aren't supported.** Authenticated WebSocket upgrade attempts to `/v1/responses` return HTTP 426 when Responses is enabled, allowing Codex to fall back immediately to HTTP streaming. Ordinary GET requests still return 404. Keep `supports_websockets = false` in new Codex provider configurations; existing tasks targeting this gateway can negotiate the fallback without a TOML change.
 * **Revocation edge case:** an invalid hand-edit of `tokens.json` keeps the *previous* file active, including tokens you meant to revoke. Use `scripts/keys.sh`.
 
 ## 12. Repository layout
