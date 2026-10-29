@@ -192,6 +192,10 @@ func TestCodexAppServerOpenAILive(t *testing.T) {
 	if completedThread != started.Thread.ID || completedTurn != turnStarted.Turn.ID || strings.TrimSpace(agentText) != "gateway-ok" {
 		t.Fatal("app-server did not complete the requested turn and answer")
 	}
+	// turn/completed can arrive before the proxy records the SSE close. Join
+	// the fixture's handlers before inspecting their final access records.
+	e.srv.CloseClientConnections()
+	e.srv.Close()
 	paths := map[string]int{}
 	for _, line := range strings.Split(e.access.String(), "\n") {
 		var rec struct {
