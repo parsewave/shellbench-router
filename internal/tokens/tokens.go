@@ -343,9 +343,24 @@ func (p *Principal) Restricted() bool {
 	return len(p.Models) > 0
 }
 
-// AllowsModel reports whether model m is permitted. Matching is exact and
-// case-sensitive; a pattern ending in * matches by prefix.
+// ModelEligible excludes prerelease, test and Daybreak model families for every
+// client. Split labels at non-letters so beta2 is excluded but latest is not.
+func ModelEligible(m string) bool {
+	for _, label := range strings.FieldsFunc(strings.ToLower(m), func(r rune) bool { return r < 'a' || r > 'z' }) {
+		switch label {
+		case "alpha", "beta", "test", "testing", "exp", "experiment", "experimental", "preview", "daybreak":
+			return false
+		}
+	}
+	return true
+}
+
+// AllowsModel applies the global exclusions before the client's allowlist.
+// Allowlist matching is exact and case-sensitive; a trailing * matches a prefix.
 func (p *Principal) AllowsModel(m string) bool {
+	if !ModelEligible(m) {
+		return false
+	}
 	if !p.Restricted() {
 		return true
 	}
