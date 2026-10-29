@@ -59,7 +59,7 @@ pxadmin add alice --allow-ips 198.51.100.24 --models gpt-4o-mini --expires 90d
 It prints a message to send them, containing the base URL, their token and their models. That's it.
 
 * `--allow-ips` locks the token to those addresses, so a leaked copy is useless anywhere else. It takes several values separated by commas, including ranges: `198.51.100.24,10.0.0.0/8`. If you leave it out, the token works from any IP.
-* If you leave out `--models`, every model is allowed. Each user gets 16 concurrent requests unless you set `--concurrency`.
+* If you leave out `--models`, every eligible model is allowed. Models labeled alpha, beta, test/testing, exp/experiment/experimental, preview, or Daybreak are excluded for everyone, including unrestricted tokens. Each user gets 16 concurrent requests unless you set `--concurrency`.
 
 ## 4. Use it
 
@@ -128,7 +128,7 @@ On the server you can do the same with `scripts/keys.sh` (`scripts/keys.sh list`
 |---|---|
 | `401 invalid_api_key` | Wrong, expired or revoked token. Check with `pxadmin list`. |
 | `403 ip_not_allowed` | The message says which IP the gateway saw. Add it: `pxadmin set NAME --allow-ips <old>,<new>`. |
-| `403 model_not_allowed` | `pxadmin set NAME --models <list>`, or `'*'` for all models. |
+| `403 model_not_allowed` | Choose an eligible model. For a client allowlist restriction, use `pxadmin set NAME --models <list>`, or `'*'` for all eligible models. Global exclusions cannot be overridden. |
 | `429` | The user hit their rate or concurrency limit. The SDK retries; raise it with `--concurrency` / `--rpm`. |
 | `protocol_not_supported` | The provider doesn't serve that model over this API. Use the Responses API, or an agent like `codex`. |
 | Harbor: "Reconnecting… error sending request" or "access token could not be refreshed" | Use the Harbor variables above (`HARBOR_ALLOW_INTERNET=1`, empty `HOME`, no Parsewave token). |

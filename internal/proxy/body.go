@@ -6,12 +6,29 @@ import (
 	"errors"
 	"io"
 	"mime/multipart"
+	"net/url"
 )
 
 type bodyInfo struct {
 	model    string
 	hasModel bool
 	stream   bool
+	tools    []byte
+}
+
+func inspectForm(b []byte) (bodyInfo, error) {
+	form, err := url.ParseQuery(string(b))
+	if err != nil {
+		return bodyInfo{}, errors.New("malformed form request body")
+	}
+	models := form["model"]
+	if len(models) > 1 {
+		return bodyInfo{}, errors.New("form body contains more than one model field")
+	}
+	if len(models) == 1 {
+		return bodyInfo{model: models[0], hasModel: true}, nil
+	}
+	return bodyInfo{}, nil
 }
 
 // Inspect without rebuilding the upload: file bytes and repeated SDK fields
@@ -46,8 +63,8 @@ func inspectMultipart(b []byte, boundary string) (bodyInfo, error) {
 	}
 }
 
-// inspectJSON extracts the top-level "model" and "stream" fields from a JSON
-// request body without decoding the rest of it.
+// inspectJSON extracts model/stream selectors and raw tools from a JSON object
+// without decoding user content. Tool objects reuse this scanner without recursion.
 //
 // It deliberately differs from encoding/json's struct decoding, which matches
 // keys case-insensitively: {"model":"o3","MODEL":"gpt-4o"} would decode as
@@ -98,6 +115,11 @@ func inspectJSON(b []byte) (bodyInfo, error) {
 			if json.Unmarshal(val, &s) == nil {
 				info.stream = s
 			}
+		case "tools":
+			if info.tools != nil {
+				return info, errors.New(`request body contains more than one "tools" field`)
+			}
+			info.tools = val
 		}
 		i = skipWS(b, i)
 		if b[i] != ',' {

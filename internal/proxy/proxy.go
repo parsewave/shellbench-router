@@ -263,6 +263,19 @@ func (p *Proxy) serveAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st.route = route.Pattern
+	if forwardsQuery(r) {
+		query, err := url.ParseQuery(r.URL.RawQuery)
+		if err != nil {
+			p.fail(w, st, http.StatusBadRequest, "invalid_request_error", "invalid_query", "Malformed query parameters.")
+			return
+		}
+		for _, model := range query["model"] {
+			if !pr.AllowsModel(model) {
+				p.fail(w, st, http.StatusForbidden, "invalid_request_error", "model_not_allowed", "This proxy token is not permitted to use the requested model.")
+				return
+			}
+		}
+	}
 
 	// 3. Backpressure: global in-flight cap, then per-client rate and concurrency.
 	if n := p.inflight.Add(1); p.opt.MaxInflight > 0 && n > int64(p.opt.MaxInflight) {
@@ -369,8 +382,10 @@ func (p *Proxy) prepareBody(w http.ResponseWriter, r *http.Request, st *reqState
 	}
 
 	var info bodyInfo
-	if mt == "multipart/form-data" && multipartEndpoint(r.URL.Path) {
+	if mt == "multipart/form-data" && (multipartEndpoint(r.URL.Path) || !pr.Restricted()) {
 		info, err = inspectMultipart(body, params["boundary"])
+	} else if mt == "application/x-www-form-urlencoded" && !pr.Restricted() {
+		info, err = inspectForm(body)
 	} else if pr.Restricted() {
 		// The model check only understands JSON, so restricted tokens may
 		// only send JSON, and upstream is told unambiguously that it is JSON.
@@ -380,8 +395,6 @@ func (p *Proxy) prepareBody(w http.ResponseWriter, r *http.Request, st *reqState
 		}
 		r.Header.Set("Content-Type", "application/json")
 		info, err = inspectJSON(body)
-	} else if mt == "multipart/form-data" || mt == "application/x-www-form-urlencoded" {
-		return true
 	} else {
 		info, err = inspectJSON(body)
 	}
@@ -390,14 +403,32 @@ func (p *Proxy) prepareBody(w http.ResponseWriter, r *http.Request, st *reqState
 		return false
 	}
 	st.model, st.stream = truncate(info.model, 128), info.stream
-	if pr.Restricted() {
-		if !info.hasModel {
-			p.fail(w, st, http.StatusBadRequest, "invalid_request_error", "model_required", `This proxy token requires an explicit "model" field.`)
+	if pr.Restricted() && !info.hasModel {
+		p.fail(w, st, http.StatusBadRequest, "invalid_request_error", "model_required", `This proxy token requires an explicit "model" field.`)
+		return false
+	}
+	if info.hasModel && !pr.AllowsModel(info.model) {
+		p.fail(w, st, http.StatusForbidden, "invalid_request_error", "model_not_allowed", fmt.Sprintf("This proxy token is not permitted to use model `%s`.", truncate(info.model, 128)))
+		return false
+	}
+	// Hosted image generation can select its own model. Inspect only direct
+	// tool selectors; arbitrary model keys in user content/schema are not policy.
+	if info.tools != nil {
+		var tools []json.RawMessage
+		if err := json.Unmarshal(info.tools, &tools); err != nil {
+			p.fail(w, st, http.StatusBadRequest, "invalid_request_error", "invalid_json", "Tools must be an array.")
 			return false
 		}
-		if !pr.AllowsModel(info.model) {
-			p.fail(w, st, http.StatusForbidden, "invalid_request_error", "model_not_allowed", fmt.Sprintf("This proxy token is not permitted to use model `%s`.", truncate(info.model, 128)))
-			return false
+		for _, tool := range tools {
+			selector, err := inspectJSON(tool)
+			if err != nil {
+				p.fail(w, st, http.StatusBadRequest, "invalid_request_error", "invalid_json", err.Error())
+				return false
+			}
+			if selector.hasModel && !tokens.ModelEligible(selector.model) {
+				p.fail(w, st, http.StatusForbidden, "invalid_request_error", "model_not_allowed", "The requested tool model is excluded by the proxy.")
+				return false
+			}
 		}
 	}
 	if r.URL.Path == "/v1/alpha/search" {
@@ -504,6 +535,10 @@ var forwardedHeaders = map[string]bool{
 	"Anthropic-Beta":    true,
 }
 
+func forwardsQuery(r *http.Request) bool {
+	return r.Method == http.MethodGet || r.Method == http.MethodDelete || strings.HasPrefix(r.URL.Path, "/v1/messages")
+}
+
 func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 	in, u := pr.In, p.opt.Upstream
 	pr.Out.URL = &url.URL{
@@ -511,7 +546,7 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 		Host:   u.Host,
 		Path:   u.Path + strings.TrimPrefix(in.URL.Path, "/v1"),
 	}
-	if in.Method == http.MethodGet || in.Method == http.MethodDelete || strings.HasPrefix(in.URL.Path, "/v1/messages") {
+	if forwardsQuery(in) {
 		pr.Out.URL.RawQuery = in.URL.RawQuery // e.g. include[], after, stream; Anthropic's ?beta=true
 	}
 	pr.Out.Host = ""
@@ -674,16 +709,28 @@ func (p *Proxy) rewriteModels(resp *http.Response, st *reqState) error {
 	if err != nil {
 		return err
 	}
-	if st.route == "GET /v1/models" && st.principal.Restricted() {
+	if st.route == "GET /v1/models" {
 		if b, err = filterModels(b, st.principal); err != nil {
 			return err
+		}
+	} else {
+		var model struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(b, &model); err != nil {
+			return fmt.Errorf("decode model detail: %w", err)
+		}
+		if !tokens.ModelEligible(model.ID) {
+			st.err, st.status = "model_not_found", http.StatusNotFound
+			replaceWithError(resp, http.StatusNotFound, "invalid_request_error", "model_not_found", "The requested model is excluded by the proxy.")
+			return nil
 		}
 	}
 	setBody(resp, p.scrubFor(st, b))
 	return nil
 }
 
-// filterModels hides models a restricted token may not use from a model list.
+// filterModels applies global exclusions and the client's model allowlist.
 func filterModels(b []byte, pr *tokens.Principal) ([]byte, error) {
 	var doc map[string]json.RawMessage
 	var data []json.RawMessage

@@ -116,3 +116,24 @@ func TestModelPatterns(t *testing.T) {
 		t.Error("* should allow all")
 	}
 }
+
+func TestExcludedModelLabels(t *testing.T) {
+	for _, marker := range []string{"alpha", "beta", "test", "testing", "exp", "experiment", "experimental", "preview", "daybreak"} {
+		for _, delimiter := range []string{"-", "_", ".", ":", "/"} {
+			model := "provider/model" + delimiter + strings.ToUpper(marker) + "2-latest"
+			for _, patterns := range [][]string{nil, {"*"}, {model}, {"provider/*"}} {
+				if (&Principal{Models: patterns}).AllowsModel(model) {
+					t.Errorf("excluded %q allowed by %v", model, patterns)
+				}
+			}
+		}
+		if ModelEligible(marker) {
+			t.Errorf("bare marker %q allowed", marker)
+		}
+	}
+	for _, model := range []string{"chatgpt-4o-latest", "gpt-6.1-sol", "gpt-image-1-mini", "text-embedding-3-small", "whisper-1", "alphafold", "contest", "expanse", "snapshot-2026-10-01"} {
+		if !(&Principal{}).AllowsModel(model) {
+			t.Errorf("stable model %q excluded", model)
+		}
+	}
+}
