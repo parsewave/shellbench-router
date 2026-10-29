@@ -756,7 +756,7 @@ func (p *Proxy) rewriteModels(resp *http.Response, st *reqState) error {
 		if err != nil {
 			return fmt.Errorf("decode model detail: %w", err)
 		}
-		if !st.principal.AllowsModel(id) {
+		if id == "" || !st.principal.AllowsModel(id) {
 			st.err, st.status = "model_not_found", http.StatusNotFound
 			replaceWithError(resp, http.StatusNotFound, "invalid_request_error", "model_not_found", "The requested model is excluded by the proxy.")
 			return nil
@@ -778,7 +778,7 @@ func filterModels(b []byte, pr *tokens.Principal) ([]byte, error) {
 	}
 	kept := make([]json.RawMessage, 0, len(data))
 	for _, m := range data {
-		if id, err := discoveryModelID(m); err == nil && pr.AllowsModel(id) {
+		if id, err := discoveryModelID(m); err == nil && id != "" && pr.AllowsModel(id) {
 			kept = append(kept, m)
 		}
 	}

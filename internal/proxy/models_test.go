@@ -236,28 +236,38 @@ func TestResolvedModelDetailUsesClientAllowlist(t *testing.T) {
 }
 
 func TestModelDiscoveryUsesExactJSONID(t *testing.T) {
-	for _, raw := range []string{
-		`{"id":"gpt-5.6-cyber","ID":"gpt-4o"}`,
-		`{"id":"gpt-4o-mini","Id":"gpt-4o"}`,
-		`{"ID":"gpt-4o"}`,
+	for _, tc := range []struct {
+		raw          string
+		unrestricted bool
+	}{
+		{`{"id":"gpt-5.6-cyber","ID":"gpt-4o"}`, false},
+		{`{"id":"gpt-4o-mini","Id":"gpt-4o"}`, true},
+		{`{"ID":"gpt-5.6-cyber"}`, false},
+		{`{"id":"","ID":"gpt-4o"}`, false},
 	} {
 		e := newEnv(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/v1/models" {
-				io.WriteString(w, `{"data":[`+raw+`]}`)
+				io.WriteString(w, `{"data":[`+tc.raw+`]}`)
 			} else {
-				io.WriteString(w, raw)
+				io.WriteString(w, tc.raw)
 			}
 		}), nil)
-		resp, b := e.do("GET", "/v1/models", e.tok["alice"], "")
-		var doc struct {
-			Data []json.RawMessage `json:"data"`
-		}
-		if resp.StatusCode != 200 || json.Unmarshal(b, &doc) != nil || len(doc.Data) != 0 {
-			t.Errorf("catalog accepted a case-insensitive ID: %d %s", resp.StatusCode, b)
-		}
-		resp, b = e.do("GET", "/v1/models/gpt-4o", e.tok["alice"], "")
-		if resp.StatusCode != 404 {
-			t.Errorf("detail accepted a case-insensitive ID: %d %s", resp.StatusCode, b)
+		for _, client := range []string{"alice", "carol"} {
+			wantLen, wantStatus := 0, 404
+			if client == "carol" && tc.unrestricted {
+				wantLen, wantStatus = 1, 200
+			}
+			resp, b := e.do("GET", "/v1/models", e.tok[client], "")
+			var doc struct {
+				Data []json.RawMessage `json:"data"`
+			}
+			if resp.StatusCode != 200 || json.Unmarshal(b, &doc) != nil || len(doc.Data) != wantLen {
+				t.Errorf("catalog accepted a case-insensitive ID: %d %s", resp.StatusCode, b)
+			}
+			resp, b = e.do("GET", "/v1/models/gpt-4o", e.tok[client], "")
+			if resp.StatusCode != wantStatus {
+				t.Errorf("detail accepted a case-insensitive ID: %d %s", resp.StatusCode, b)
+			}
 		}
 	}
 }
