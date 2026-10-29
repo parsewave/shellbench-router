@@ -219,3 +219,54 @@ func TestExcludedModelsHiddenFromCatalog(t *testing.T) {
 		}
 	}
 }
+
+func TestResolvedModelDetailUsesClientAllowlist(t *testing.T) {
+	e := newEnv(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"id":"gpt-4o-mini","object":"model"}`)
+	}), nil)
+	for _, tc := range []struct {
+		client string
+		status int
+	}{{"alice", 404}, {"carol", 200}} {
+		resp, b := e.do("GET", "/v1/models/gpt-4o", e.tok[tc.client], "")
+		if resp.StatusCode != tc.status || tc.status == 404 && strings.Contains(string(b), "gpt-4o-mini") {
+			t.Errorf("%s canonical detail: %d %s", tc.client, resp.StatusCode, b)
+		}
+	}
+}
+
+func TestModelDiscoveryCannotCacheSharedRepresentations(t *testing.T) {
+	for _, status := range []int{200, 404} {
+		e := newEnv(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Trailer", "ETag, Last-Modified, Location, Content-Location, Cache-Control")
+			w.Header().Set("Cache-Control", "public, max-age=3600")
+			for _, h := range []string{"ETag", "Last-Modified", "Location", "Content-Location"} {
+				w.Header().Set(h, "hidden-model-fixture")
+			}
+			w.WriteHeader(status)
+			if strings.HasSuffix(r.URL.Path, "/models") {
+				io.WriteString(w, `{"object":"list","data":[{"id":"gpt-4o"},{"id":"gpt-4o-mini"}]}`)
+			} else {
+				io.WriteString(w, `{"id":"gpt-4o","object":"model"}`)
+			}
+			w.(http.Flusher).Flush()
+			for _, h := range []string{"ETag", "Last-Modified", "Location", "Content-Location", "Cache-Control"} {
+				w.Header().Set(h, "late-hidden-model-fixture")
+			}
+		}), nil)
+		for _, path := range []string{"/v1/models", "/v1/models/gpt-4o"} {
+			resp, _ := e.do("GET", path, e.tok["alice"], "")
+			if resp.StatusCode != status || resp.Header.Get("Cache-Control") != "private, no-store" {
+				t.Errorf("%s status/cache: %d %q", path, resp.StatusCode, resp.Header.Get("Cache-Control"))
+			}
+			for _, h := range []string{"ETag", "Last-Modified", "Location", "Content-Location"} {
+				if resp.Header.Get(h) != "" || resp.Trailer.Get(h) != "" {
+					t.Errorf("%s exposed %s", path, h)
+				}
+			}
+			if resp.Trailer.Get("Cache-Control") != "" {
+				t.Errorf("%s exposed upstream cache policy in trailers", path)
+			}
+		}
+	}
+}

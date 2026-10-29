@@ -33,6 +33,13 @@ func (p *Proxy) scrubFor(st *reqState, b []byte) []byte {
 }
 
 func (p *Proxy) sanitizeHeaders(h http.Header, st *reqState) {
+	if st != nil && isModelDiscovery(st.route) {
+		// Discovery is filtered per client; provider validators and cache policy
+		// describe a different representation and can disclose hidden model IDs.
+		for _, name := range []string{"Cache-Control", "ETag", "Last-Modified", "Location", "Content-Location"} {
+			h.Del(name)
+		}
+	}
 	for _, name := range strippedResponseHeaders {
 		h.Del(name)
 	}
