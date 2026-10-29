@@ -128,7 +128,7 @@ func TestClientLifecycle(t *testing.T) {
 		t.Fatalf("client view %v", c)
 	}
 	p, err := e.authenticate(tok)
-	if err != nil || p.ID != "alice" || !p.AllowsModel("o3-mini") || p.AllowsModel("gpt-4o-mini") {
+	if err != nil || p.ID != "alice" || !p.AllowsModel("o3-2025-04-16") || p.AllowsModel("gpt-4o-mini") {
 		t.Fatalf("authenticate: %+v %v", p, err)
 	}
 	if e.reloads.Load() == 0 {

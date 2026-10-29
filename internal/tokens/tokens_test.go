@@ -107,7 +107,7 @@ func TestValidate(t *testing.T) {
 
 func TestModelPatterns(t *testing.T) {
 	p := &Principal{Models: []string{"gpt-4o", "o3-*"}}
-	for m, want := range map[string]bool{"gpt-4o": true, "gpt-4o-mini": false, "GPT-4O": false, "o3-mini": true, "o3": false, "": false} {
+	for m, want := range map[string]bool{"gpt-4o": true, "gpt-4o-mini": false, "GPT-4O": false, "o3-2025-04-16": true, "o3": false, "": false} {
 		if p.AllowsModel(m) != want {
 			t.Errorf("%q: want %v", m, want)
 		}
@@ -131,7 +131,7 @@ func TestExcludedModelLabels(t *testing.T) {
 			t.Errorf("bare marker %q allowed", marker)
 		}
 	}
-	for _, model := range []string{"chatgpt-4o-latest", "gpt-6.1-sol", "gpt-image-1-mini", "text-embedding-3-small", "whisper-1", "alphafold", "contest", "expanse", "snapshot-2026-10-01"} {
+	for _, model := range []string{"fixture-latest", "gpt-6.1-sol", "gpt-image-1-mini", "text-embedding-3-small", "whisper-1", "alphafold", "contest", "expanse", "snapshot-2026-10-01"} {
 		if !(&Principal{}).AllowsModel(model) {
 			t.Errorf("stable model %q excluded", model)
 		}

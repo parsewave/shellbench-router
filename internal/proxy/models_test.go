@@ -83,10 +83,10 @@ func TestExcludedModelsNeverDispatch(t *testing.T) {
 	}
 	// Markers in user content and endpoint/header names are not model IDs.
 	for _, tc := range []struct{ path, body, ct string }{
-		{"/v1/responses", `{"model":"chatgpt-4o-latest","input":"test alpha beta exp daybreak","metadata":{"model":"experiment"}}`, "application/json"},
+		{"/v1/responses", `{"model":"fixture-latest","input":"test alpha beta exp daybreak","metadata":{"model":"experiment"}}`, "application/json"},
 		{"/v1/messages?beta=true", `{"model":"gpt-4o","messages":[]}`, "application/json"},
 		{"/v1/alpha/search", `{"model":"gpt-4o","id":"fixture","commands":{"search_query":[{"q":"daybreak beta test"}]}}`, "application/json"},
-		{"/v1/chat/completions", "model=chatgpt-4o-latest&input=daybreak", "application/x-www-form-urlencoded"},
+		{"/v1/chat/completions", "model=fixture-latest&input=daybreak", "application/x-www-form-urlencoded"},
 		{"/v1/responses", `{"model":"gpt-4o","tools":[{"type":"image_generation","model":"gpt-image-1-mini"},{"type":"function","name":"test","parameters":{"type":"object","properties":{"model":{"const":"daybreak"}}}}]}`, "application/json"},
 	} {
 		resp, b := e.do("POST", tc.path, e.tok["carol"], tc.body, "Content-Type", tc.ct, "OpenAI-Beta", "fixture=v1")
@@ -140,26 +140,65 @@ func TestModelExclusionsOpenAILive(t *testing.T) {
 	t.Logf("eligible live catalog models: %d; stable Responses call completed", len(doc.Data))
 }
 
-func TestExcludedModelDetailAlias(t *testing.T) {
+func TestRetiredAndCyberSelectorsNeverDispatch(t *testing.T) {
+	var calls atomic.Int64
 	e := newEnv(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, `{"id":"gpt-4o-preview","object":"model"}`)
+		calls.Add(1)
+		w.WriteHeader(200)
 	}), nil)
-	resp, b := e.do("GET", "/v1/models/alias", e.tok["carol"], "")
-	if resp.StatusCode != 404 || errCode(t, b) != "model_not_found" || strings.Contains(string(b), "gpt-4o-preview") {
-		t.Fatalf("excluded canonical model leaked: %d %s", resp.StatusCode, b)
+	for _, model := range []string{"gpt-4", "gpt-image-1", "openai/ft:o1:org:custom:123", "gpt-5.6-CyBeR", "cybermodel"} {
+		for _, client := range []string{"alice", "carol"} {
+			for _, tc := range []struct{ method, path, body, ct string }{
+				{"POST", "/v1/responses", fmt.Sprintf(`{"model":%q}`, model), "application/json"},
+				{"POST", "/v1/responses", fmt.Sprintf(`{"model":"gpt-4o","tools":[{"type":"image_generation","model":%q}]}`, model), "application/json"},
+				{"POST", "/v1/chat/completions", "model=" + url.QueryEscape(model), "application/x-www-form-urlencoded"},
+				{"GET", "/v1/models/" + url.PathEscape(model), "", ""},
+				{"GET", "/v1/responses/resp_fixture?model=" + url.QueryEscape(model), "", ""},
+				{"DELETE", "/v1/responses/resp_fixture?model=" + url.QueryEscape(model), "", ""},
+				{"POST", "/v1/messages?model=" + url.QueryEscape(model), "", ""},
+			} {
+				resp, _ := e.do(tc.method, tc.path, e.tok[client], tc.body, "Content-Type", tc.ct)
+				if resp.StatusCode != 403 && resp.StatusCode != 404 {
+					t.Errorf("%s %s %s %s: %d", client, model, tc.method, tc.path, resp.StatusCode)
+				}
+			}
+			body, ct := upload(t, []string{model}, false, false)
+			resp, _ := e.do("POST", "/v1/images/edits", e.tok[client], body, "Content-Type", ct)
+			if resp.StatusCode != 403 {
+				t.Errorf("%s multipart %s: %d", client, model, resp.StatusCode)
+			}
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("excluded selectors reached upstream %d times", calls.Load())
+	}
+}
+
+func TestExcludedModelDetailAlias(t *testing.T) {
+	for _, model := range []string{"gpt-4o-preview", "gpt-4", "gpt-5.6-cyber"} {
+		e := newEnv(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, `{"id":%q,"object":"model"}`, model)
+		}), nil)
+		resp, b := e.do("GET", "/v1/models/alias", e.tok["carol"], "")
+		if resp.StatusCode != 404 || errCode(t, b) != "model_not_found" || strings.Contains(string(b), model) {
+			t.Fatalf("excluded canonical model leaked: %d %s", resp.StatusCode, b)
+		}
 	}
 }
 
 func TestExcludedModelsHiddenFromCatalog(t *testing.T) {
-	data := `[ {"id":"gpt-4o","object":"model","created":123}, {"id":"chatgpt-4o-latest"}`
+	data := `[ {"id":"gpt-4o","object":"model","created":123}, {"id":"fixture-latest"}`
 	for _, marker := range []string{"alpha", "beta", "test", "exp", "experiment", "experimental", "preview", "daybreak"} {
 		data += fmt.Sprintf(`,{"id":"gpt-4o-%s"}`, marker)
+	}
+	for _, model := range []string{"gpt-4", "gpt-image-1", "gpt-5.6-CyBeR", "cybermodel"} {
+		data += fmt.Sprintf(`,{"id":%q}`, model)
 	}
 	data += `]`
 	e := newEnv(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"object":"list","metadata":"fixture","data":`+data+`}`)
 	}), nil)
-	for _, tc := range []struct{ client, want string }{{"carol", "gpt-4o,chatgpt-4o-latest"}, {"alice", "gpt-4o"}} {
+	for _, tc := range []struct{ client, want string }{{"carol", "gpt-4o,fixture-latest"}, {"alice", "gpt-4o"}} {
 		resp, b := e.do("GET", "/v1/models", e.tok[tc.client], "")
 		var doc struct {
 			Object, Metadata string

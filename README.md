@@ -59,7 +59,7 @@ pxadmin add alice --allow-ips 198.51.100.24 --models gpt-4o-mini --expires 90d
 It prints a message to send them, containing the base URL, their token and their models. That's it.
 
 * `--allow-ips` locks the token to those addresses, so a leaked copy is useless anywhere else. It takes several values separated by commas, including ranges: `198.51.100.24,10.0.0.0/8`. If you leave it out, the token works from any IP.
-* If you leave out `--models`, every eligible model is allowed. Models labeled alpha, beta, test/testing, exp/experiment/experimental, preview, or Daybreak are excluded for everyone, including unrestricted tokens. Each user gets 16 concurrent requests unless you set `--concurrency`.
+* If you leave out `--models`, every eligible model is allowed. Models labeled alpha, beta, test/testing, exp/experiment/experimental, preview, or Daybreak, and IDs containing `cyber` (case-insensitive), are excluded for everyone, including unrestricted tokens. Known retired models are also excluded using the maintained list in `internal/tokens/models.go`, based on the [OpenAI shutdown schedule](https://developers.openai.com/api/docs/deprecations). Excluded models are hidden from the catalog and model details; explicit body, query, multipart, form, and hosted-tool model selectors are rejected. Each user gets 16 concurrent requests unless you set `--concurrency`.
 
 ## 4. Use it
 
