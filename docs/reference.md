@@ -216,6 +216,14 @@ All configuration is through environment variables (`.env`). See `.env.example`.
 
 Default routes: `POST /v1/responses`, `POST /v1/responses/compact`, `POST /v1/responses/input_tokens`, `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/embeddings`, `POST /v1/decisions`, `POST /v1/audio/speech`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `POST /v1/images/generations`, `POST /v1/images/edits`, `POST /v1/moderations`, `POST /v1/messages`, `POST /v1/messages/count_tokens` (Anthropic Messages API, for Claude Code), `GET /v1/models`, `GET /v1/models/*`, `GET|DELETE /v1/responses/*`, `POST /v1/responses/*/cancel`, `GET /v1/responses/*/input_items`. These are model calls and model listing; nothing that stores files or data on the provider account (files, uploads, batches, vector stores, conversations) or manages it (organization, projects, fine-tuning) is forwarded. Any other path returns 404 without contacting the upstream, logged as a warning with `"error":"unknown_url"` and the path, so `docker compose logs proxy | grep unknown_url` shows what clients asked for. Clients always call `/v1/...`; the gateway maps that onto the upstream base path (e.g. OpenRouter's `/api/v1`).
 
+### Codex model discovery
+
+`GET /v1/models` returns the provider's public OpenAI-compatible catalog. Codex requests `GET /v1/models?client_version=MAJOR.MINOR.PATCH` instead: this returns the native `models` catalog, including provider-owned instructions and capabilities. With the exact OpenAI upstream `https://api.openai.com/v1`, the gateway fetches it from `https://chatgpt.com/backend-api/codex/models` using its server-held API key. Caller headers, organization/project attribution, and configured extra headers are not sent across origins. Custom upstreams remain on their configured origin and must serve the native format themselves.
+
+Native catalogs are bounded to 1 MiB, require unique nonempty slugs, and include only models marked `supported_in_api` that pass the client's model policy. Model instructions and other metadata are preserved. Both catalog formats are private and non-cacheable. Invalid versions return 400; malformed or oversized provider catalogs return 502. The [Codex catalog contract](https://learn.chatgpt.com/docs/model-catalogs) describes client discovery and `model_catalog_url`.
+
+Codex's `workspace routing discovery failed` concerns its signed-in ChatGPT account and `chatgpt_base_url`, independently of the named inference provider. Keep that setting pointed at the ChatGPT service; do not redirect it to this gateway. The gateway does not implement ChatGPT account or workspace services.
+
 ## 6. Reliability behaviour
 
 **Retries never duplicate potentially billable work:**
@@ -348,6 +356,8 @@ Opt-in OpenAI proof makes billable requests. Inject `OPENAI_API_KEY` into the te
 SHELLBENCH_OPENAI_LIVE=1 go test ./internal/proxy -run '^(TestOpenAILive|TestSearchOpenAILive|TestDecisionsOpenAILive)$' -count=1 -v
 # Point this at the standalone native binary, not a shell/login wrapper:
 SHELLBENCH_OPENAI_LIVE=1 SHELLBENCH_CODEX_BIN=/path/to/codex go test ./internal/proxy -run '^TestNativeCodexOpenAILive$' -count=1 -v
+# Point this at the app's bundled native binary to verify model discovery and a turn:
+SHELLBENCH_OPENAI_LIVE=1 SHELLBENCH_CODEX_BIN=/path/to/app-bundled/codex go test ./internal/proxy -run '^TestCodexAppServerOpenAILive$' -count=1 -v
 ```
 
 The media proof requires actual hosted web-search citations, generated/edited images, speech, transcription, translation, and embeddings. The native fixture uses an empty home, a proxy token only, and HTTP/SSE (`supports_websockets=false`). Its provider name is `OpenAI`, as required by Codex's standalone-search capability gate; `features.standalone_web_search=true` enables that experimental path. It checks both Responses and standalone search traffic and a completed answer. The upstream key remains in the Go server process.
