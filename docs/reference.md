@@ -175,6 +175,7 @@ Errors use OpenAI's error format, so SDK exception types work as usual:
 | 400 | `model_required` / `invalid_json` / `invalid_content_type` | Restricted token sent no `model`, or the body or headers are malformed or ambiguous |
 | 404 | `unknown_url` / `model_not_found` | Endpoint not enabled on this gateway / model hidden from this token |
 | 413 | `request_too_large` | Body exceeds `MAX_REQUEST_BYTES` |
+| 408 | `invalid_request_body` | Upload exceeded its idle or total deadline; retry after checking the client connection and request size |
 | 429 | `rate_limit_exceeded` / `concurrency_limit_exceeded` | Per-token limit (with `Retry-After`) |
 | 429 | (upstream's code) | Upstream rate limit, after the gateway's own safe retries |
 | 502 | `upstream_auth_error` | The provider's upstream key was rejected. Contact the operator. |
@@ -206,7 +207,7 @@ All configuration is through environment variables (`.env`). See `.env.example`.
 | `MAX_RETRY_WAIT` | 20s | A longer upstream `Retry-After` is passed to the client instead |
 | `UPSTREAM_TIMEOUT` | 30m | Total per request (long reasoning) |
 | `STREAM_IDLE_TIMEOUT` | 10m | Max silence between upstream bytes. Also frees clients that stop reading. |
-| `BODY_READ_TIMEOUT` | 60s | Slow-upload guard |
+| `BODY_READ_TIMEOUT` | 60s | Maximum silence between incoming body bytes. Progress renews the idle deadline; total upload time is capped at 10 times this value (10m by default). A nonpositive value disables both upload deadlines. Successful uploads clear these deadlines before inference/streaming. |
 | `LOG_FORMAT` / `LOG_LEVEL` | `json` / `info` | stdout |
 | `ACCESS_LOG_FILE` | — | Optional JSONL access log. Put it on its own rotated volume. |
 | `SHUTDOWN_TIMEOUT` | 30s | Grace period for in-flight requests on SIGTERM |

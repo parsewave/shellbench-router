@@ -6,8 +6,31 @@ import (
 	"errors"
 	"io"
 	"mime/multipart"
+	"net/http"
 	"net/url"
+	"time"
 )
+
+// Renew only on progress, while the fixed total deadline prevents drip uploads
+// from holding body reservations and request slots indefinitely.
+type uploadReader struct {
+	io.Reader
+	rc    *http.ResponseController
+	idle  time.Duration
+	total time.Time
+}
+
+func (r *uploadReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if n > 0 && err == nil {
+		deadline := time.Now().Add(r.idle)
+		if r.total.Before(deadline) {
+			deadline = r.total
+		}
+		r.rc.SetReadDeadline(deadline)
+	}
+	return n, err
+}
 
 type bodyInfo struct {
 	model    string
