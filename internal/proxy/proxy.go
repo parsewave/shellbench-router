@@ -483,7 +483,18 @@ func multipartEndpoint(path string) bool {
 	return false
 }
 
-func (p *Proxy) readBody(w http.ResponseWriter, r *http.Request, st *reqState) ([]byte, int, error) {
+func (p *Proxy) readBody(w http.ResponseWriter, r *http.Request, st *reqState) (body []byte, status int, err error) {
+	rc := http.NewResponseController(w)
+	defer func() {
+		if err != nil && r.ProtoMajor == 1 {
+			// Go drains unfinished HTTP/1 bodies before flushing an error.
+			// Close reuse and expire reads so that drain cannot hide the error.
+			w.Header().Set("Connection", "close")
+			rc.SetReadDeadline(time.Now())
+		} else if err == nil && p.opt.BodyReadTimeout > 0 {
+			rc.SetReadDeadline(time.Time{})
+		}
+	}()
 	limit := p.opt.MaxRequestBytes
 	if r.ContentLength > limit {
 		return nil, http.StatusRequestEntityTooLarge, fmt.Errorf("request body exceeds %d bytes", limit)
@@ -500,17 +511,14 @@ func (p *Proxy) readBody(w http.ResponseWriter, r *http.Request, st *reqState) (
 	}
 	st.bodyReserved = reserve
 	if p.opt.BodyReadTimeout > 0 {
-		rc := http.NewResponseController(w)
-		if rc.SetReadDeadline(time.Now().Add(p.opt.BodyReadTimeout)) == nil {
-			defer rc.SetReadDeadline(time.Time{})
-		}
+		rc.SetReadDeadline(time.Now().Add(p.opt.BodyReadTimeout))
 	}
 	var buf bytes.Buffer
 	if r.ContentLength > 0 {
 		// Bounded: a client must not make us allocate what it only declares.
 		buf.Grow(int(min(r.ContentLength, 1<<20)) + 1)
 	}
-	_, err := buf.ReadFrom(http.MaxBytesReader(w, r.Body, limit))
+	_, err = buf.ReadFrom(http.MaxBytesReader(w, r.Body, limit))
 	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
