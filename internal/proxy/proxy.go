@@ -510,15 +510,23 @@ func (p *Proxy) readBody(w http.ResponseWriter, r *http.Request, st *reqState) (
 		return nil, http.StatusServiceUnavailable, errors.New("The proxy is at capacity; retry shortly.")
 	}
 	st.bodyReserved = reserve
+	var reader io.Reader = http.MaxBytesReader(w, r.Body, limit)
 	if p.opt.BodyReadTimeout > 0 {
-		rc.SetReadDeadline(time.Now().Add(p.opt.BodyReadTimeout))
+		now := time.Now()
+		total := now
+		// Add intervals separately so scaling a valid duration cannot overflow.
+		for range 10 {
+			total = total.Add(p.opt.BodyReadTimeout)
+		}
+		rc.SetReadDeadline(now.Add(p.opt.BodyReadTimeout))
+		reader = &uploadReader{Reader: reader, rc: rc, idle: p.opt.BodyReadTimeout, total: total}
 	}
 	var buf bytes.Buffer
 	if r.ContentLength > 0 {
 		// Bounded: a client must not make us allocate what it only declares.
 		buf.Grow(int(min(r.ContentLength, 1<<20)) + 1)
 	}
-	_, err = buf.ReadFrom(http.MaxBytesReader(w, r.Body, limit))
+	_, err = buf.ReadFrom(reader)
 	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
