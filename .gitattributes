@@ -1,0 +1,2 @@
+# Unified diff context requires leading spaces, including before Go tabs.
+deploy/caddy/*.patch -whitespace

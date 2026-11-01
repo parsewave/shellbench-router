@@ -33,7 +33,10 @@ services:
       options: { max-size: "50m", max-file: "5" }
 
   caddy:
-    image: caddy:2.11-alpine
+    build:
+      context: .
+      dockerfile: deploy/caddy/Dockerfile
+    image: oaiproxy-caddy:latest
     restart: unless-stopped
     depends_on:
       proxy:

@@ -3,6 +3,14 @@
 	# Caddy's access log is off by default; keep it that way or it will
 	# record request metadata. Authorization headers are redacted by Caddy
 	# even if you enable it.
+	servers {
+		timeouts {
+			# Let the proxy's 60s idle / 10m total upload limits respond first.
+			# These bound request-body reads, not completed-body SSE responses.
+			read_body_idle 65s
+			read_body 11m
+		}
+	}
 }
 
 {$PROXY_DOMAIN} {
