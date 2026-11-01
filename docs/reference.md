@@ -215,6 +215,10 @@ All configuration is through environment variables (`.env`). See `.env.example`.
 | `ADMIN_LISTEN_ADDR` | `127.0.0.1:8081` | Separate admin listener. Docker binds container `:8081` and publishes only host `127.0.0.1:8081`; host networking binds loopback directly. Never open port 8081 in a firewall/security group. |
 | `TRUSTED_PROXIES` | loopback + private ranges | Peers whose `X-Forwarded-For` is used as the client IP for allowlists (Caddy). Never expose the proxy port itself. |
 
+The Compose build includes Caddy v2.11.7 with the upstream [request-body deadline fix](https://github.com/caddyserver/caddy/pull/8178) backported. Without it, HTTP/1 cleanup can hide a timed-out upload's error response. The default Caddyfile allows 65s between body reads and 11m total body time, giving the proxy's default 60s idle and 10m total limits time to return an error. These limits stop applying after a complete upload; they do not cap SSE response duration.
+
+If you change `BODY_READ_TIMEOUT`, also adjust the existing Caddyfile limits: edge idle must exceed proxy idle, and edge total must exceed ten times proxy idle with room for headers and dispatch. Disabling proxy upload deadlines does not disable Caddy's limits.
+
 Default routes: `POST /v1/responses`, `POST /v1/responses/compact`, `POST /v1/responses/input_tokens`, `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/embeddings`, `POST /v1/decisions`, `POST /v1/audio/speech`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `POST /v1/images/generations`, `POST /v1/images/edits`, `POST /v1/moderations`, `POST /v1/messages`, `POST /v1/messages/count_tokens` (Anthropic Messages API, for Claude Code), `GET /v1/models`, `GET /v1/models/*`, `GET|DELETE /v1/responses/*`, `POST /v1/responses/*/cancel`, `GET /v1/responses/*/input_items`. These are model calls and model listing; nothing that stores files or data on the provider account (files, uploads, batches, vector stores, conversations) or manages it (organization, projects, fine-tuning) is forwarded. Any other path returns 404 without contacting the upstream, logged as a warning with `"error":"unknown_url"` and the path, so `docker compose logs proxy | grep unknown_url` shows what clients asked for. Clients always call `/v1/...`; the gateway maps that onto the upstream base path (e.g. OpenRouter's `/api/v1`).
 
 ### Codex model discovery
@@ -275,6 +279,21 @@ One structured record per request goes to stdout, and optionally to a JSONL file
 ## 9. Test and benchmark results
 
 ### Automated tests
+
+The Caddy image build runs the focused request-reader tests. To test HTTP/1 response delivery and connection cleanup with a secretless mock backend:
+
+```bash
+docker build --target upload-test -f deploy/caddy/Dockerfile -t oaiproxy-caddy-upload-test .
+docker run --rm --network none --read-only --user 65532:65532 \
+  --cap-drop ALL --security-opt no-new-privileges --cpus 1 --memory 256m \
+  --pids-limit 64 --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  oaiproxy-caddy-upload-test
+```
+
+The fixture reports all controls and fails unless the bounded, non-duplex candidate passes all eight contracts: stalled fixed/chunked bodies, early backend errors, progressing uploads, the total upload cap, completed-body SSE, and connection reuse. It tests Caddy with a mock backend, not provider access or the router's pre-body authentication paths.
+
+For a before-fix control, build the `stock-upload-test` target instead. The same candidate contracts must fail with unmodified Caddy.
+
 * **Go suite:** 38 tests plus an 11-case retry table. Passes with `go test -race`, repeated runs.
   * **Core properties:** valid and invalid tokens; per-client model access, including parser-differential and Content-Type bypass attempts; that provider keys never reach clients and client credentials never reach the upstream; byte-for-byte passthrough; incremental SSE; 300 concurrent requests; per-token and global limits.
   * **Failure handling:** cancellation propagated mid-stream and before headers; upstream and idle timeouts; a stalled reader being released; the retry policy; dropped connections and interrupted streams not replayed; and logs, access log and metrics free of secrets.
